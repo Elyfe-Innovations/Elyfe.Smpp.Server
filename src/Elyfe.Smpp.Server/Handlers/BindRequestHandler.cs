@@ -24,6 +24,7 @@ public static class BindRequestHandler
         {
             ctx.Logger.LogWarning("Bind rejected for session {SessionId}: already bound", ctx.SessionId);
             response.Header.ErrorCode = SmppErrorCode.ESME_RALYBND;
+            ctx.Metrics.RecordBind("already_bound");
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -36,6 +37,7 @@ public static class BindRequestHandler
                 ctx.SessionId,
                 version);
             response.Header.ErrorCode = SmppErrorCode.ESME_RINVBNDSTS;
+            ctx.Metrics.RecordBind("bad_version");
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -43,6 +45,18 @@ public static class BindRequestHandler
         if (string.IsNullOrWhiteSpace(request.SystemID))
         {
             response.Header.ErrorCode = SmppErrorCode.ESME_RINVSYSID;
+            ctx.Metrics.RecordBind("missing_system_id");
+            await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (!ctx.CanBindSystemId(request.SystemID))
+        {
+            ctx.Logger.LogWarning(
+                "Bind rejected for system_id {SystemId}: per-system_id connection cap reached",
+                request.SystemID);
+            response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
+            ctx.Metrics.RecordBind("cap_reached");
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -63,6 +77,7 @@ public static class BindRequestHandler
             ctx.Logger.LogError(ex, "Authentication error for session {SessionId} system_id {SystemId}",
                 ctx.SessionId, request.SystemID);
             response.Header.ErrorCode = SmppErrorCode.ESME_RSYSERR;
+            ctx.Metrics.RecordBind("auth_error");
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -72,6 +87,7 @@ public static class BindRequestHandler
             ctx.Logger.LogWarning("Bind authentication failed for system_id {SystemId}: {Reason}",
                 request.SystemID, auth.FailureReason);
             response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
+            ctx.Metrics.RecordBind("auth_failed");
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -85,6 +101,7 @@ public static class BindRequestHandler
 
         ctx.MarkBound(mode, request.SystemID, auth.TenantId, version);
         response.Header.ErrorCode = SmppErrorCode.ESME_ROK;
+        ctx.Metrics.RecordBind("ok");
         await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
 
         ctx.Logger.LogInformation(

@@ -2,6 +2,7 @@ using Elyfe.Smpp.Server.Authentication;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -28,6 +29,7 @@ public static class ServiceCollectionExtensions
         }
 
         services.TryAddSingleton(sp => sp.GetRequiredService<IOptions<SmppServerOptions>>().Value);
+        services.TryAddSingleton<SmppServerMetrics>();
         services.TryAddSingleton<SessionManager>();
         services.TryAddSingleton<ISmppServer, SmppServer>();
         services.AddHostedService<SmppServerService>();
@@ -85,5 +87,23 @@ public static class ServiceCollectionExtensions
             new FileAuthenticatorOptions { FilePath = filePath },
             sp.GetRequiredService<ILogger<FileBasedAuthenticator>>()));
         return services;
+    }
+
+    /// <summary>
+    ///     Adds the SMPP server health check to a health-checks builder. Reports healthy while the listener is
+    ///     accepting connections.
+    /// </summary>
+    public static IHealthChecksBuilder AddSmppServerHealthCheck(
+        this IHealthChecksBuilder builder,
+        string name = "smpp-server",
+        HealthStatus failureStatus = HealthStatus.Unhealthy,
+        IEnumerable<string>? tags = null)
+    {
+        builder.Add(new HealthCheckRegistration(
+            name,
+            sp => new SmppServerHealthCheck(sp.GetRequiredService<ISmppServer>()),
+            failureStatus,
+            tags));
+        return builder;
     }
 }

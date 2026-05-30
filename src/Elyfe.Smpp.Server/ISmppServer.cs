@@ -8,6 +8,12 @@ namespace Elyfe.Smpp.Server;
 /// </summary>
 public interface ISmppServer
 {
+    /// <summary>Whether the TCP listener is currently accepting connections.</summary>
+    bool IsListening { get; }
+
+    /// <summary>The number of currently active sessions.</summary>
+    int ActiveSessions { get; }
+
     /// <summary>Starts the accept loop and idle sweeper.</summary>
     Task StartAsync(CancellationToken cancellationToken);
 

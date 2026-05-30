@@ -2,6 +2,7 @@ using Elyfe.Smpp.Server.Bridge;
 using JamaaTech.Smpp.Net.Lib;
 using JamaaTech.Smpp.Net.Lib.Protocol;
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 
 namespace Elyfe.Smpp.Server.Handlers;
 
@@ -22,6 +23,7 @@ public static class SubmitSmHandler
         if (ctx.Status is not (SmppSessionStatus.BoundTx or SmppSessionStatus.BoundTrx))
         {
             response.Header.ErrorCode = SmppErrorCode.ESME_RINVBNDSTS;
+            ctx.Metrics.RecordSubmit("not_bound");
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -30,6 +32,7 @@ public static class SubmitSmHandler
         {
             ctx.Logger.LogWarning("submit_sm throttled for session {SessionId}", ctx.SessionId);
             response.Header.ErrorCode = SmppErrorCode.ESME_RTHROTTLED;
+            ctx.Metrics.RecordSubmit("throttled");
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -46,6 +49,7 @@ public static class SubmitSmHandler
             RemoteAddress = ctx.RemoteAddress
         };
 
+        var startTimestamp = Stopwatch.GetTimestamp();
         try
         {
             var result = await ctx.MessageHandler.HandleSubmitAsync(request, cancellationToken).ConfigureAwait(false);
@@ -53,18 +57,26 @@ public static class SubmitSmHandler
             {
                 response.MessageID = result.MessageId;
                 response.Header.ErrorCode = SmppErrorCode.ESME_ROK;
+                ctx.Metrics.RecordSubmit("accepted");
             }
             else
             {
                 ctx.Logger.LogWarning("submit_sm rejected by platform for session {SessionId}: {Reason}",
                     ctx.SessionId, result.FailureReason);
                 response.Header.ErrorCode = SmppErrorCode.ESME_RSUBMITFAIL;
+                ctx.Metrics.RecordSubmit("rejected");
             }
         }
         catch (Exception ex)
         {
             ctx.Logger.LogError(ex, "submit_sm bridge error for session {SessionId}", ctx.SessionId);
             response.Header.ErrorCode = SmppErrorCode.ESME_RSYSERR;
+            ctx.Metrics.RecordSubmit("error");
+            ctx.Metrics.RecordError("submit_bridge");
+        }
+        finally
+        {
+            ctx.Metrics.RecordSubmitDuration(Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds);
         }
 
         await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);

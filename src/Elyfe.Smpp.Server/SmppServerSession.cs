@@ -19,6 +19,7 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
     private readonly Stream _stream;
     private readonly SmppPduChannel _channel;
     private readonly object _rateLock = new();
+    private readonly Func<string, bool>? _canBindSystemId;
 
     private long _sequenceNumber;
     private SmppBindMode _bindMode = SmppBindMode.None;
@@ -40,7 +41,9 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
         SmppEncodingService encoding,
         IAuthenticator authenticator,
         IMessageHandler messageHandler,
-        ILogger logger)
+        ILogger logger,
+        SmppServerMetrics? metrics = null,
+        Func<string, bool>? canBindSystemId = null)
     {
         _socket = socket;
         _stream = stream;
@@ -49,6 +52,8 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
         Authenticator = authenticator;
         MessageHandler = messageHandler;
         Logger = logger;
+        Metrics = metrics ?? new SmppServerMetrics();
+        _canBindSystemId = canBindSystemId;
         _channel = new SmppPduChannel(stream, encoding);
 
         SessionId = Guid.NewGuid().ToString("N");
@@ -94,6 +99,9 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
 
     /// <inheritdoc />
     public ILogger Logger { get; }
+
+    /// <inheritdoc />
+    public SmppServerMetrics Metrics { get; }
 
     /// <summary>
     ///     Runs the session: enforces the bind timeout, then reads and dispatches PDUs until the peer unbinds, the
@@ -236,6 +244,10 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
         // Stop the bind-timeout clock now that the session is bound.
         _bindTimeoutCts?.CancelAfter(Timeout.InfiniteTimeSpan);
     }
+
+    /// <inheritdoc />
+    public bool CanBindSystemId(string systemId)
+        => _canBindSystemId is null || _canBindSystemId(systemId);
 
     /// <inheritdoc />
     public void MarkUnbound()

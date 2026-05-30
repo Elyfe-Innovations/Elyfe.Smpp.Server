@@ -21,6 +21,7 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
     private readonly IMessageHandler _messageHandler;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<SmppServer> _logger;
+    private readonly SmppServerMetrics _metrics;
     private readonly SmppEncodingService _encoding = new();
 
     private TcpIpListener? _listener;
@@ -35,7 +36,8 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
         SessionManager sessionManager,
         IAuthenticator authenticator,
         IMessageHandler messageHandler,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        SmppServerMetrics? metrics = null)
     {
         _options = options;
         _sessionManager = sessionManager;
@@ -43,7 +45,16 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
         _messageHandler = messageHandler;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<SmppServer>();
+        _metrics = metrics ?? new SmppServerMetrics();
+        _metrics.TrackActiveSessions(() => _sessionManager.Count);
     }
+
+    /// <summary>Whether the TCP listener is currently accepting connections.</summary>
+    public bool IsListening { get; private set; }
+
+    /// <summary>The number of currently active sessions.</summary>
+    public int ActiveSessions => _sessionManager.Count;
+
 
     /// <inheritdoc />
     public Task StartAsync(CancellationToken cancellationToken)
@@ -66,6 +77,7 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
         _logger.LogInformation("SMPP server listening on {EndPoint} (TLS={Tls})",
             _listener.EndPoint, _options.Tls.Enabled);
 
+        IsListening = true;
         _acceptLoop = Task.Run(() => AcceptLoopAsync(_stoppingCts.Token), CancellationToken.None);
         _idleSweepLoop = Task.Run(() => IdleSweepLoopAsync(_stoppingCts.Token), CancellationToken.None);
         return Task.CompletedTask;
@@ -75,6 +87,7 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("Stopping SMPP server");
+        IsListening = false;
 
         if (_stoppingCts is not null)
         {
@@ -99,6 +112,14 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
     /// <inheritdoc />
     public Task<bool> DeliverAsync(SmppDeliverRequest request, CancellationToken cancellationToken)
         => _sessionManager.DeliverToTenantAsync(request, cancellationToken);
+
+    /// <summary>
+    ///     Per-<c>system_id</c> connection-cap predicate passed to each session. Returns <c>true</c> when another
+    ///     session may bind under <paramref name="systemId" /> without exceeding <see cref="SmppServerOptions.MaxSessionsPerSystemId" />.
+    /// </summary>
+    private bool CanBindSystemId(string systemId)
+        => _options.MaxSessionsPerSystemId <= 0
+           || _sessionManager.CountBySystemId(systemId) < _options.MaxSessionsPerSystemId;
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
     {
@@ -136,7 +157,9 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
                 _encoding,
                 _authenticator,
                 _messageHandler,
-                _loggerFactory.CreateLogger<SmppServerSession>());
+                _loggerFactory.CreateLogger<SmppServerSession>(),
+                _metrics,
+                CanBindSystemId);
 
             if (!_sessionManager.TryRegister(session))
             {

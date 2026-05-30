@@ -45,6 +45,9 @@ public interface ISmppSessionContext
     /// <summary>A logger scoped to the session.</summary>
     ILogger Logger { get; }
 
+    /// <summary>Server metrics for instrumenting bind/submit/error events.</summary>
+    SmppServerMetrics Metrics { get; }
+
     /// <summary>Sends a PDU to the connected ESME.</summary>
     Task SendAsync(PDU pdu, CancellationToken cancellationToken);
 
@@ -55,6 +58,12 @@ public interface ISmppSessionContext
     ///     Transitions the session into a bound state after successful authentication.
     /// </summary>
     void MarkBound(SmppBindMode mode, string systemId, string tenantId, byte interfaceVersion);
+
+    /// <summary>
+    ///     Returns <c>true</c> when a new session may bind under the supplied <c>system_id</c> without exceeding the
+    ///     configured per-<c>system_id</c> connection cap.
+    /// </summary>
+    bool CanBindSystemId(string systemId);
 
     /// <summary>Begins the unbind / close sequence.</summary>
     void MarkUnbound();
