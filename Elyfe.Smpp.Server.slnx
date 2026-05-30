@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Elyfe.Smpp.Server/Elyfe.Smpp.Server.csproj" />
+  </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/Elyfe.Smpp.Server.Tests/Elyfe.Smpp.Server.Tests.csproj" />
+  </Folder>
+  <Folder Name="/Solution Items/">
+    <File Path="README.md" />
+    <File Path="LICENSE" />
+  </Folder>
+</Solution>
