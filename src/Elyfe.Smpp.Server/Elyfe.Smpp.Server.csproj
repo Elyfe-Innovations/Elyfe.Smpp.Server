@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Elyfe.Smpp.Server</RootNamespace>
+    <AssemblyName>Elyfe.Smpp.Server</AssemblyName>
+    <PackageId>Elyfe.Smpp.Server</PackageId>
+    <Title>Elyfe SMPP Server</Title>
+    <Description>An open source SMPP v3.4 and v5.0 server (SMSC-side) implementation for .NET. Accepts ESME binds and bridges submit_sm / deliver_sm traffic to a pluggable message handler.</Description>
+    <Authors>Alfred Neequaye, Elyfe Innovations</Authors>
+    <Company>Elyfe Innovations</Company>
+    <Copyright>Copyright (C) Elyfe Innovations. Portions Copyright (C) 2007 Jamaa Technologies.</Copyright>
+    <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Elyfe-Innovations/Elyfe.Smpp.Server</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Elyfe-Innovations/Elyfe.Smpp.Server</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>smpp;smsc;sms;server;esme</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.3" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.3" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.3" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.3" />
+    <PackageReference Include="System.Diagnostics.DiagnosticSource" Version="10.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\Elyfe.Smpp\JamaaTech.Smpp.Net.Lib\Smpp.Net.Lib.csproj" />
+  </ItemGroup>
+
+</Project>
