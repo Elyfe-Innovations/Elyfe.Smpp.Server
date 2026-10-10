@@ -132,7 +132,7 @@ Bind from the `SmppServer` configuration section:
 | `MaxInterfaceVersion` | `0x50` (80) | Highest accepted SMPP version. |
 | `AdvertisedInterfaceVersion` | `0x34` (52) | Version reported in the bind response's `sc_interface_version` TLV. |
 | `MaxSubmitsPerSecond` | `100` | Per-session submit rate limit (0 = off). |
-| `WindowSize` | `100` | Max `deliver_sm` PDUs awaiting `deliver_sm_resp` per session; further deliveries wait (0 = off). |
+| `WindowSize` | `100` | Max `deliver_sm` PDUs awaiting `deliver_sm_resp` per session; further deliveries wait. Also bounds requests read ahead of the one being handled (0 = off). |
 | `DeliverResponseTimeout` | `1.00:00:00` | Time a delivery waits for a window slot and `deliver_sm_resp` before it fails. It fails sooner if the session closes or the caller cancels. |
 | `ShutdownDrainTimeout` | `00:00:10` | Time shutdown waits for sessions to acknowledge `unbind` before closing them. |
 | `Tls.Enabled` | `false` | Require TLS before SMPP traffic. |

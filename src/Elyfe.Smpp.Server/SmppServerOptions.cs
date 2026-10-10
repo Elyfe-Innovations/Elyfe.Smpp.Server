@@ -76,8 +76,8 @@ public sealed class SmppServerOptions
 
     /// <summary>
     ///     SMPP window size: maximum number of server-originated <c>deliver_sm</c> PDUs a session may have in flight
-    ///     awaiting <c>deliver_sm_resp</c>. Further deliveries wait for a free slot. Zero or negative disables the
-    ///     window check.
+    ///     awaiting <c>deliver_sm_resp</c>. Further deliveries wait for a free slot. It also bounds how many ESME
+    ///     requests a session reads ahead of the one being handled. Zero or negative disables both limits.
     /// </summary>
     public int WindowSize { get; set; } = 100;
 

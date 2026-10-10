@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net.Sockets;
+using System.Threading.Channels;
 using Elyfe.Smpp.Server.Authentication;
 using Elyfe.Smpp.Server.Bridge;
 using Elyfe.Smpp.Server.Handlers;
@@ -119,13 +120,27 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
     public SmppServerMetrics Metrics { get; }
 
     /// <summary>
-    ///     Runs the session: enforces the bind timeout, then reads and dispatches PDUs until the peer unbinds, the
-    ///     connection closes, or the host shuts down.
+    ///     Runs the session: enforces the bind timeout, then reads PDUs until the peer unbinds, the connection closes,
+    ///     or the host shuts down. Responses are handled as they are read, while requests are handed to a worker that
+    ///     processes them in arrival order, so a slow request handler never stops the session from seeing the
+    ///     <c>deliver_sm_resp</c> it (or another caller) is waiting for.
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _bindTimeoutCts = new CancellationTokenSource(Options.BindTimeout);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _bindTimeoutCts.Token);
+
+        // Cancelled by the request worker once it has ended the session (an unbind or a failed write).
+        using var stop = new CancellationTokenSource();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, _bindTimeoutCts.Token, stop.Token);
+
+        // Bounded so an ESME that pipelines beyond the window is held back by TCP rather than buffered without limit.
+        var requests = Options.WindowSize > 0
+            ? Channel.CreateBounded<SmppFrame>(
+                new BoundedChannelOptions(Options.WindowSize) { SingleReader = true, SingleWriter = true })
+            : Channel.CreateUnbounded<SmppFrame>(
+                new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+        var worker = ProcessRequestsAsync(requests.Reader, stop, cancellationToken);
 
         try
         {
@@ -158,7 +173,15 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
                 }
 
                 LastActivityUtc = DateTimeOffset.UtcNow;
-                await DispatchAsync(frame.Value, cancellationToken).ConfigureAwait(false);
+
+                if (IsResponse(frame.Value.Header))
+                {
+                    await DispatchAsync(frame.Value, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await requests.Writer.WriteAsync(frame.Value, linked.Token).ConfigureAwait(false);
+                }
 
                 if (_unbindRequested)
                 {
@@ -178,7 +201,60 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
         {
             Status = SmppSessionStatus.Closed;
             FailPendingDeliveries();
+
+            // The request already being handled finishes and is answered; requests still queued are dropped.
+            requests.Writer.TryComplete();
+            await worker.ConfigureAwait(false);
+
+            Status = SmppSessionStatus.Closed;
             _closed.TrySetResult();
+        }
+    }
+
+    private static bool IsResponse(PDUHeader header) => ((uint)header.CommandType & 0x80000000) != 0;
+
+    /// <summary>
+    ///     Handles queued requests one at a time, in the order they were read. Never throws: any failure ends the
+    ///     session by cancelling <paramref name="stop" />.
+    /// </summary>
+    private async Task ProcessRequestsAsync(
+        ChannelReader<SmppFrame> requests, CancellationTokenSource stop, CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (await requests.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
+            {
+                while (requests.TryRead(out var frame))
+                {
+                    if (Status is SmppSessionStatus.Closed)
+                    {
+                        return;
+                    }
+
+                    await DispatchAsync(frame, cancellationToken).ConfigureAwait(false);
+
+                    if (_unbindRequested)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Host shutdown; the read loop is ending too.
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            Logger.LogDebug(ex, "Session {SessionId} I/O ended while answering a request", SessionId);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Session {SessionId} closed: request handling failed", SessionId);
+        }
+        finally
+        {
+            await stop.CancelAsync().ConfigureAwait(false);
         }
     }
 
@@ -377,8 +453,8 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
 
     /// <summary>
     ///     Begins a server-initiated unbind for graceful shutdown: stops accepting new work, sends <c>unbind</c> and
-    ///     waits until the read loop has finished the in-flight exchange and seen <c>unbind_resp</c> (or the peer
-    ///     closed). Returns early, leaving the session open, if <paramref name="cancellationToken" /> fires first.
+    ///     waits until the session has seen <c>unbind_resp</c> (or the peer closed) and answered the request it was
+    ///     handling. Returns early, leaving the session open, if <paramref name="cancellationToken" /> fires first.
     /// </summary>
     public async Task UnbindAsync(CancellationToken cancellationToken)
     {

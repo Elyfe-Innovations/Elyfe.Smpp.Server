@@ -400,6 +400,57 @@ public class SmppServerIntegrationTests
     }
 
     [Fact]
+    public async Task Deliver_IsAcknowledged_WhileSubmitHandlerIsStillRunning()
+    {
+        var options = new SmppServerOptions
+        {
+            Port = GetFreePort(),
+            BindAddress = "127.0.0.1",
+            SystemId = "TestSMSC",
+            ShutdownDrainTimeout = TimeSpan.FromMilliseconds(200)
+        };
+        SmppServer? server = null;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+
+        // The submit handler delivers on the submitting session and waits for the ESME's acknowledgement.
+        var handler = new FakeMessageHandler
+        {
+            OnSubmit = async _ => await server!.DeliverAsync(Deliver("echo"), cts.Token)
+                ? SmppSubmitResult.Success("echoed")
+                : SmppSubmitResult.Failure("deliver failed")
+        };
+        server = BuildServer(options, handler);
+        await using var _ = server;
+        await server.StartAsync(cts.Token);
+
+        using var client = new TcpClient();
+        var channel = await BindTransceiverAsync(client, options.Port, cts.Token);
+
+        var submit = (SubmitSm)PDU.CreatePDU(new PDUHeader(CommandType.SubmitSm, 2), _encoding);
+        submit.SourceAddress.Address = "1234";
+        submit.DestinationAddress.Address = "233200000000";
+        submit.SetMessageText("ping", DataCoding.ASCII);
+        await channel.WriteAsync(submit, cts.Token);
+
+        // A second request pipelined behind the blocked one must be answered after it, in order.
+        var enquire = PDU.CreatePDU(new PDUHeader(CommandType.EnquireLink, 3), _encoding);
+        await channel.WriteAsync(enquire, cts.Token);
+
+        var deliver = Assert.IsType<DeliverSm>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        await channel.WriteAsync(deliver.CreateDefaultResponse(), cts.Token);
+
+        var submitResp = Assert.IsType<SubmitSmResp>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        Assert.Equal(SmppErrorCode.ESME_ROK, submitResp.Header.ErrorCode);
+        Assert.Equal("echoed", submitResp.MessageID);
+
+        var enquireResp = (await channel.ReadAsync(cts.Token))!.Value;
+        Assert.Equal(CommandType.EnquireLinkResp, enquireResp.Header.CommandType);
+        Assert.Equal(3u, enquireResp.Header.SequenceNumber);
+
+        await server.StopAsync(cts.Token);
+    }
+
+    [Fact]
     public async Task SubmitBeforeBind_IsRejected()
     {
         var options = new SmppServerOptions
@@ -446,10 +497,18 @@ internal sealed class FakeMessageHandler : IMessageHandler
 
     public SmppSubmitRequest? LastSubmit { get; private set; }
 
+    /// <summary>When set, produces the submit result (takes precedence over the other settings).</summary>
+    public Func<SmppSubmitRequest, Task<SmppSubmitResult>>? OnSubmit { get; set; }
+
     public Task<SmppSubmitResult> HandleSubmitAsync(SmppSubmitRequest request, CancellationToken cancellationToken = default)
     {
         LastSubmit = request;
         SubmitStarted.TrySetResult();
+        if (OnSubmit is not null)
+        {
+            return OnSubmit(request);
+        }
+
         return PendingSubmit ?? Task.FromResult(SubmitResult);
     }
 
