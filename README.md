@@ -107,7 +107,7 @@ Bind from the `SmppServer` configuration section:
     "MaxInterfaceVersion": 80,
     "MaxSubmitsPerSecond": 100,
     "WindowSize": 100,
-    "DeliverResponseTimeout": "00:00:30",
+    "DeliverResponseTimeout": "1.00:00:00",
     "ShutdownDrainTimeout": "00:00:10",
     "Tls": {
       "Enabled": false,
@@ -132,7 +132,7 @@ Bind from the `SmppServer` configuration section:
 | `MaxInterfaceVersion` | `0x50` (80) | Highest accepted SMPP version. |
 | `MaxSubmitsPerSecond` | `100` | Per-session submit rate limit (0 = off). |
 | `WindowSize` | `100` | Max `deliver_sm` PDUs awaiting `deliver_sm_resp` per session; further deliveries wait (0 = off). |
-| `DeliverResponseTimeout` | `00:00:30` | Time a delivery waits for a window slot and `deliver_sm_resp` before it fails. |
+| `DeliverResponseTimeout` | `1.00:00:00` | Time a delivery waits for a window slot and `deliver_sm_resp` before it fails. It fails sooner if the session closes or the caller cancels. |
 | `ShutdownDrainTimeout` | `00:00:10` | Time shutdown waits for sessions to acknowledge `unbind` before closing them. |
 | `Tls.Enabled` | `false` | Require TLS before SMPP traffic. |
 | `Tls.CertificatePath` | – | PKCS#12 (.pfx) server certificate. |

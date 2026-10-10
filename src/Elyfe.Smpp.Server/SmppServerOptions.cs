@@ -76,9 +76,10 @@ public sealed class SmppServerOptions
 
     /// <summary>
     ///     How long a delivery waits for a window slot and the ESME's <c>deliver_sm_resp</c> before it is reported as
-    ///     failed. Zero or negative waits until the session closes.
+    ///     failed. Defaults to one day so a slow ESME gets the widest opportunity to acknowledge; a delivery still
+    ///     fails sooner if the session closes or the caller cancels. Zero or negative waits until the session closes.
     /// </summary>
-    public TimeSpan DeliverResponseTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan DeliverResponseTimeout { get; set; } = TimeSpan.FromDays(1);
 
     /// <summary>
     ///     How long shutdown waits for bound sessions to complete in-flight exchanges and acknowledge the server's
