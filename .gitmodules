@@ -1,0 +1,3 @@
+[submodule "external/Elyfe.Smpp"]
+	path = external/Elyfe.Smpp
+	url = https://github.com/Elyfe-Innovations/Elyfe.Smpp.git

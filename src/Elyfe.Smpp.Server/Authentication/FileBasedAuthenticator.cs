@@ -55,6 +55,7 @@ public sealed class FileBasedAuthenticator : IAuthenticator
         {
             if (!File.Exists(_filePath))
             {
+                ClearAccounts();
                 return;
             }
 
@@ -70,6 +71,23 @@ public sealed class FileBasedAuthenticator : IAuthenticator
         }
     }
 
+    // A removed credential file revokes every account; resetting the timestamp makes a recreated file reload.
+    private void ClearAccounts()
+    {
+        bool hadAccounts;
+        lock (_gate)
+        {
+            hadAccounts = _accounts.Count > 0 || _lastWriteUtc != DateTime.MinValue;
+            _accounts = new Dictionary<string, SmppAccount>(StringComparer.Ordinal);
+            _lastWriteUtc = DateTime.MinValue;
+        }
+
+        if (hadAccounts)
+        {
+            _logger.LogWarning("SMPP credential file {FilePath} not found; all accounts revoked", _filePath);
+        }
+    }
+
     private void Reload()
     {
         try
@@ -77,6 +95,7 @@ public sealed class FileBasedAuthenticator : IAuthenticator
             if (!File.Exists(_filePath))
             {
                 _logger.LogWarning("SMPP credential file {FilePath} not found", _filePath);
+                ClearAccounts();
                 return;
             }
 

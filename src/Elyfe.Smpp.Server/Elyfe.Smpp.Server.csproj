@@ -37,8 +37,18 @@
     <PackageReference Include="System.Diagnostics.DiagnosticSource" Version="10.0.11" />
   </ItemGroup>
 
+  <!--
+    The PDU codec comes from the Elyfe.Smpp repository. A standalone checkout uses the external/Elyfe.Smpp submodule;
+    when this repository is itself checked out next to Elyfe.Smpp (e.g. as sibling submodules of a host repository)
+    the sibling copy is used instead so the host builds a single codec project.
+  -->
+  <PropertyGroup>
+    <ElyfeSmppRoot Condition="'$(ElyfeSmppRoot)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\..\Elyfe.Smpp\JamaaTech.Smpp.Net.Lib\Smpp.Net.Lib.csproj')">$(MSBuildThisFileDirectory)..\..\..\Elyfe.Smpp\</ElyfeSmppRoot>
+    <ElyfeSmppRoot Condition="'$(ElyfeSmppRoot)' == ''">$(MSBuildThisFileDirectory)..\..\external\Elyfe.Smpp\</ElyfeSmppRoot>
+  </PropertyGroup>
+
   <ItemGroup>
-    <ProjectReference Include="..\..\..\Elyfe.Smpp\JamaaTech.Smpp.Net.Lib\Smpp.Net.Lib.csproj" />
+    <ProjectReference Include="$(ElyfeSmppRoot)JamaaTech.Smpp.Net.Lib\Smpp.Net.Lib.csproj" />
   </ItemGroup>
 
 </Project>

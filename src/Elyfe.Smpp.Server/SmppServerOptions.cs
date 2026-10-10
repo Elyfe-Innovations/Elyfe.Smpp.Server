@@ -41,7 +41,8 @@ public sealed class SmppServerOptions
     public TimeSpan IdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    ///     How long the server waits for a bind PDU after a TCP connection is accepted before closing it.
+    ///     How long the server waits for a bind PDU after a TCP connection is accepted before closing it. The same
+    ///     deadline applies to the TLS handshake when TLS is enabled.
     /// </summary>
     public TimeSpan BindTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
@@ -67,10 +68,23 @@ public sealed class SmppServerOptions
     public int MaxSubmitsPerSecond { get; set; } = 100;
 
     /// <summary>
-    ///     SMPP window size: maximum number of unacknowledged outstanding PDUs a session may have in flight.
-    ///     Zero or negative disables the window check.
+    ///     SMPP window size: maximum number of server-originated <c>deliver_sm</c> PDUs a session may have in flight
+    ///     awaiting <c>deliver_sm_resp</c>. Further deliveries wait for a free slot. Zero or negative disables the
+    ///     window check.
     /// </summary>
     public int WindowSize { get; set; } = 100;
+
+    /// <summary>
+    ///     How long a delivery waits for a window slot and the ESME's <c>deliver_sm_resp</c> before it is reported as
+    ///     failed. Zero or negative waits until the session closes.
+    /// </summary>
+    public TimeSpan DeliverResponseTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    ///     How long shutdown waits for bound sessions to complete in-flight exchanges and acknowledge the server's
+    ///     <c>unbind</c> before connections are closed. Zero or negative closes connections immediately.
+    /// </summary>
+    public TimeSpan ShutdownDrainTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
     ///     TLS configuration. When <see cref="TlsOptions.Enabled" /> is <c>true</c> the listener performs a TLS

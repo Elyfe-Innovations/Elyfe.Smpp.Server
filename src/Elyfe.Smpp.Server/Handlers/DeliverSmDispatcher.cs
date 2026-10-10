@@ -2,6 +2,7 @@ using System.Text;
 using Elyfe.Smpp.Server.Bridge;
 using JamaaTech.Smpp.Net.Lib;
 using JamaaTech.Smpp.Net.Lib.Protocol;
+using JamaaTech.Smpp.Net.Lib.Protocol.Tlv;
 
 namespace Elyfe.Smpp.Server.Handlers;
 
@@ -15,30 +16,44 @@ public static class DeliverSmDispatcher
 
     /// <summary>
     ///     Constructs a <c>deliver_sm</c> PDU from a platform deliver request. Delivery receipts set the
-    ///     <see cref="EsmClass.DeliveryReceipt" /> indicator in <c>esm_class</c>.
+    ///     <see cref="EsmClass.DeliveryReceipt" /> indicator in <c>esm_class</c>. Text that is not pure ASCII is sent
+    ///     as UCS2, and a body too long for <c>short_message</c> is carried in the <c>message_payload</c> TLV, so the
+    ///     message is never altered or cut.
     /// </summary>
     public static DeliverSm Build(SmppDeliverRequest request, SmppEncodingService encoding, uint sequenceNumber)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(encoding);
 
+        var text = request.Message ?? string.Empty;
+        var dataCoding = Ascii.IsValid(text) ? DataCoding.ASCII : DataCoding.UCS2;
+        var bytes = text.Length == 0 ? [] : encoding.GetBytesFromString(text, dataCoding);
+        if (bytes.Length > ushort.MaxValue)
+        {
+            throw new ArgumentException(
+                $"Message of {bytes.Length} bytes exceeds the {ushort.MaxValue}-byte message_payload limit.",
+                nameof(request));
+        }
+
         var header = new PDUHeader(CommandType.DeliverSm, sequenceNumber);
         var deliver = new DeliverSm(header, encoding)
         {
-            DataCoding = DataCoding.ASCII,
+            DataCoding = dataCoding,
             EsmClass = request.IsDeliveryReceipt ? EsmClass.DeliveryReceipt : EsmClass.Default
         };
 
         deliver.SourceAddress.Address = request.SourceAddress;
         deliver.DestinationAddress.Address = request.DestinationAddress;
 
-        var bytes = Encoding.ASCII.GetBytes(request.Message ?? string.Empty);
-        if (bytes.Length > MaxShortMessageBytes)
+        if (bytes.Length <= MaxShortMessageBytes)
         {
-            bytes = bytes[..MaxShortMessageBytes];
+            deliver.SetMessageBytes(bytes);
+        }
+        else
+        {
+            deliver.SetOptionalParamBytes(Tag.message_payload, bytes);
         }
 
-        deliver.SetMessageBytes(bytes);
         return deliver;
     }
 }

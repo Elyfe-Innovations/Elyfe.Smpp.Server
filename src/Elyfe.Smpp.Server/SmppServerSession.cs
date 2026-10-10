@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net.Sockets;
 using Elyfe.Smpp.Server.Authentication;
 using Elyfe.Smpp.Server.Bridge;
@@ -19,7 +20,13 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
     private readonly Stream _stream;
     private readonly SmppPduChannel _channel;
     private readonly object _rateLock = new();
-    private readonly Func<string, bool>? _canBindSystemId;
+    private readonly SessionManager? _sessionManager;
+
+    // Server-originated deliver_sm PDUs awaiting deliver_sm_resp, keyed by sequence number. A null result means the
+    // session closed before the ESME answered.
+    private readonly ConcurrentDictionary<uint, TaskCompletionSource<SmppErrorCode?>> _pendingDeliveries = new();
+    private readonly SemaphoreSlim? _deliverWindow;
+    private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private long _sequenceNumber;
     private SmppBindMode _bindMode = SmppBindMode.None;
@@ -32,7 +39,8 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
     private long _windowTicks;
 
     /// <summary>
-    ///     Creates a session over an accepted connection.
+    ///     Creates a session over an accepted connection. When a <paramref name="sessionManager" /> is supplied it
+    ///     enforces the per-<c>system_id</c> connection cap at bind time.
     /// </summary>
     public SmppServerSession(
         Socket socket,
@@ -43,7 +51,7 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
         IMessageHandler messageHandler,
         ILogger logger,
         SmppServerMetrics? metrics = null,
-        Func<string, bool>? canBindSystemId = null)
+        SessionManager? sessionManager = null)
     {
         _socket = socket;
         _stream = stream;
@@ -53,14 +61,15 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
         MessageHandler = messageHandler;
         Logger = logger;
         Metrics = metrics ?? new SmppServerMetrics();
-        _canBindSystemId = canBindSystemId;
+        _sessionManager = sessionManager;
+        _deliverWindow = options.WindowSize > 0 ? new SemaphoreSlim(options.WindowSize, options.WindowSize) : null;
         _channel = new SmppPduChannel(stream, encoding);
 
         SessionId = Guid.NewGuid().ToString("N");
         RemoteAddress = socket.RemoteEndPoint?.ToString();
         Status = SmppSessionStatus.Open;
         LastActivityUtc = DateTimeOffset.UtcNow;
-        _submitTokens = Math.Max(1, options.MaxSubmitsPerSecond);
+        _submitTokens = options.MaxSubmitsPerSecond;
         _windowTicks = DateTimeOffset.UtcNow.Ticks;
     }
 
@@ -75,6 +84,12 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
 
     /// <inheritdoc />
     public string? SystemId { get; private set; }
+
+    /// <summary>
+    ///     The <c>system_id</c> this session counts against for the per-<c>system_id</c> cap. Set from the start of a
+    ///     bind attempt; owned by <see cref="SessionManager" />.
+    /// </summary>
+    internal string? ReservedSystemId { get; set; }
 
     /// <inheritdoc />
     public string? TenantId { get; private set; }
@@ -157,6 +172,8 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
         finally
         {
             Status = SmppSessionStatus.Closed;
+            FailPendingDeliveries();
+            _closed.TrySetResult();
         }
     }
 
@@ -196,6 +213,21 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
             case Unbind unbind:
                 await UnbindHandler.HandleAsync(this, unbind, cancellationToken).ConfigureAwait(false);
                 break;
+            case DeliverSmResp or GenericNack:
+                // The ESME's answer to a server-originated deliver_sm (a generic_nack carries its sequence number).
+                if (_pendingDeliveries.TryRemove(frame.Header.SequenceNumber, out var pending))
+                {
+                    pending.TrySetResult(frame.Header.ErrorCode);
+                }
+
+                break;
+            case UnbindResp:
+                // The ESME acknowledged a server-initiated unbind; the exchange is drained.
+                _unbindRequested = true;
+                break;
+            case ResponsePDU:
+                // Other responses (e.g. enquire_link_resp) need no reply; LastActivityUtc is already refreshed.
+                break;
             default:
                 var nack = GenericNackHandler.Build(Encoding, frame.Header.SequenceNumber, SmppErrorCode.ESME_RINVCMDID);
                 await SendAsync(nack, cancellationToken).ConfigureAwait(false);
@@ -205,18 +237,121 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
 
     /// <summary>
     ///     Pushes a mobile-originated message or delivery receipt to this session when it is bound as a receiver or
-    ///     transceiver. Returns <c>false</c> when the session cannot currently accept deliveries.
+    ///     transceiver, and waits for the ESME's <c>deliver_sm_resp</c>. Returns <c>true</c> only when the ESME
+    ///     acknowledged the delivery with <c>ESME_ROK</c>; <c>false</c> when the session cannot accept deliveries, the
+    ///     ESME rejected the message, the session closed, or no response (or free window slot) arrived within
+    ///     <see cref="SmppServerOptions.DeliverResponseTimeout" />.
     /// </summary>
     public async Task<bool> DeliverAsync(SmppDeliverRequest request, CancellationToken cancellationToken)
     {
-        if (Status is not (SmppSessionStatus.BoundRx or SmppSessionStatus.BoundTrx))
+        if (!CanReceiveDeliveries)
         {
             return false;
         }
 
-        var deliver = DeliverSmDispatcher.Build(request, Encoding, NextSequenceNumber());
-        await SendAsync(deliver, cancellationToken).ConfigureAwait(false);
-        return true;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (Options.DeliverResponseTimeout > TimeSpan.Zero)
+        {
+            timeoutCts.CancelAfter(Options.DeliverResponseTimeout);
+        }
+
+        var windowHeld = false;
+        uint? sequenceNumber = null;
+        try
+        {
+            if (_deliverWindow is not null)
+            {
+                await _deliverWindow.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+                windowHeld = true;
+            }
+
+            sequenceNumber = NextSequenceNumber();
+            var pending = new TaskCompletionSource<SmppErrorCode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingDeliveries[sequenceNumber.Value] = pending;
+
+            // Re-check after registering so a session that closed meanwhile cannot strand the waiter.
+            if (!CanReceiveDeliveries)
+            {
+                return false;
+            }
+
+            var deliver = DeliverSmDispatcher.Build(request, Encoding, sequenceNumber.Value);
+            await SendAsync(deliver, timeoutCts.Token).ConfigureAwait(false);
+
+            var status = await pending.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            if (status == SmppErrorCode.ESME_ROK)
+            {
+                return true;
+            }
+
+            Logger.LogWarning(
+                "deliver_sm {SequenceNumber} on session {SessionId} was not acknowledged: {Status}",
+                sequenceNumber, SessionId, status?.ToString() ?? "session closed");
+            Metrics.RecordError(status is null ? "deliver_session_closed" : "deliver_rejected");
+            return false;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            Logger.LogWarning(
+                "deliver_sm on session {SessionId} timed out after {Timeout} waiting for {Awaited}",
+                SessionId, Options.DeliverResponseTimeout, sequenceNumber is null ? "a window slot" : "deliver_sm_resp");
+            Metrics.RecordError("deliver_timeout");
+            return false;
+        }
+        finally
+        {
+            if (sequenceNumber is not null)
+            {
+                _pendingDeliveries.TryRemove(sequenceNumber.Value, out _);
+            }
+
+            if (windowHeld)
+            {
+                _deliverWindow!.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Begins a server-initiated unbind for graceful shutdown: stops accepting new work, sends <c>unbind</c> and
+    ///     waits until the read loop has finished the in-flight exchange and seen <c>unbind_resp</c> (or the peer
+    ///     closed). Returns early, leaving the session open, if <paramref name="cancellationToken" /> fires first.
+    /// </summary>
+    public async Task UnbindAsync(CancellationToken cancellationToken)
+    {
+        if (Status is not (SmppSessionStatus.BoundTx or SmppSessionStatus.BoundRx or SmppSessionStatus.BoundTrx))
+        {
+            return;
+        }
+
+        Status = SmppSessionStatus.Unbound;
+        try
+        {
+            var unbind = PDU.CreatePDU(new PDUHeader(CommandType.UnBind, NextSequenceNumber()), Encoding);
+            await SendAsync(unbind, cancellationToken).ConfigureAwait(false);
+            await _closed.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            Logger.LogWarning("Session {SessionId} ({SystemId}) did not acknowledge unbind in time", SessionId, SystemId);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            Logger.LogDebug(ex, "Session {SessionId} closed while unbinding", SessionId);
+        }
+    }
+
+    private bool CanReceiveDeliveries => Status is SmppSessionStatus.BoundRx or SmppSessionStatus.BoundTrx;
+
+    private void FailPendingDeliveries()
+    {
+        foreach (var sequenceNumber in _pendingDeliveries.Keys)
+        {
+            if (_pendingDeliveries.TryRemove(sequenceNumber, out var pending))
+            {
+                pending.TrySetResult(null);
+            }
+        }
     }
 
     /// <inheritdoc />
@@ -246,8 +381,11 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
     }
 
     /// <inheritdoc />
-    public bool CanBindSystemId(string systemId)
-        => _canBindSystemId is null || _canBindSystemId(systemId);
+    public bool TryReserveSystemId(string systemId)
+        => _sessionManager is null || _sessionManager.TryReserveSystemId(this, systemId);
+
+    /// <inheritdoc />
+    public void ReleaseSystemId() => _sessionManager?.ReleaseSystemId(this);
 
     /// <inheritdoc />
     public void MarkUnbound()
@@ -268,7 +406,12 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
     /// <inheritdoc />
     public bool TryConsumeSubmitToken()
     {
-        var max = Math.Max(1, Options.MaxSubmitsPerSecond);
+        var max = Options.MaxSubmitsPerSecond;
+        if (max <= 0)
+        {
+            return true; // Throttling disabled.
+        }
+
         lock (_rateLock)
         {
             var now = DateTimeOffset.UtcNow.Ticks;
@@ -297,6 +440,7 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
         }
 
         Status = SmppSessionStatus.Closed;
+        FailPendingDeliveries();
         _bindTimeoutCts?.Dispose();
 
         try

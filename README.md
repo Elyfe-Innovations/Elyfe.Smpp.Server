@@ -107,6 +107,8 @@ Bind from the `SmppServer` configuration section:
     "MaxInterfaceVersion": 80,
     "MaxSubmitsPerSecond": 100,
     "WindowSize": 100,
+    "DeliverResponseTimeout": "00:00:30",
+    "ShutdownDrainTimeout": "00:00:10",
     "Tls": {
       "Enabled": false,
       "CertificatePath": "/certs/smpp.pfx",
@@ -124,12 +126,14 @@ Bind from the `SmppServer` configuration section:
 | `MaxSessions` | `1000` | Global concurrent-session cap (0 = unlimited). |
 | `MaxSessionsPerSystemId` | `10` | Per-`system_id` cap (0 = unlimited). |
 | `IdleTimeout` | `00:05:00` | Idle session is closed after this. |
-| `BindTimeout` | `00:00:30` | Time to wait for a bind after TCP accept. |
+| `BindTimeout` | `00:00:30` | Time to wait for a bind after TCP accept (also the TLS handshake deadline). |
 | `EnquireLinkInterval` | `00:01:00` | Expected keepalive interval. |
 | `MinInterfaceVersion` | `0x34` (52) | Lowest accepted SMPP version. |
 | `MaxInterfaceVersion` | `0x50` (80) | Highest accepted SMPP version. |
 | `MaxSubmitsPerSecond` | `100` | Per-session submit rate limit (0 = off). |
-| `WindowSize` | `100` | Max outstanding unacknowledged PDUs (0 = off). |
+| `WindowSize` | `100` | Max `deliver_sm` PDUs awaiting `deliver_sm_resp` per session; further deliveries wait (0 = off). |
+| `DeliverResponseTimeout` | `00:00:30` | Time a delivery waits for a window slot and `deliver_sm_resp` before it fails. |
+| `ShutdownDrainTimeout` | `00:00:10` | Time shutdown waits for sessions to acknowledge `unbind` before closing them. |
 | `Tls.Enabled` | `false` | Require TLS before SMPP traffic. |
 | `Tls.CertificatePath` | – | PKCS#12 (.pfx) server certificate. |
 | `Tls.CertificatePassword` | – | Certificate password. |
@@ -138,7 +142,7 @@ Bind from the `SmppServer` configuration section:
 
 Choose one of the built-in authenticators or supply your own `IAuthenticator`.
 
-**Config-based** — accounts live in the `SmppAuthentication` section:
+**Config-based** — accounts live in the `SmppServer:Authentication` section:
 
 ```csharp
 builder.Services.AddSmppConfigAuthentication(builder.Configuration);
@@ -146,21 +150,28 @@ builder.Services.AddSmppConfigAuthentication(builder.Configuration);
 
 ```json
 {
-  "SmppAuthentication": {
-    "Accounts": [
-      { "SystemId": "acme", "Password": "<sha256-hex-or-plaintext>", "TenantId": "tenant-1", "Enabled": true }
-    ]
+  "SmppServer": {
+    "Authentication": {
+      "Accounts": [
+        { "SystemId": "acme", "PasswordSha256": "<sha256-hex>", "TenantId": "tenant-1", "Enabled": true }
+      ]
+    }
   }
 }
 ```
 
-Passwords may be plaintext or a lowercase hex SHA-256 hash.
+Set `PasswordSha256` to the lowercase hex SHA-256 hash of the password. For local
+development a plaintext `Password` may be used instead; `PasswordSha256` takes
+precedence when both are set.
 
 **File-based** — accounts in an external JSON file:
 
 ```csharp
 builder.Services.AddSmppFileAuthentication("/etc/smpp/accounts.json");
 ```
+
+The file is a JSON array of the same account objects. It is re-read when it changes,
+and removing it revokes every account.
 
 **Custom** — register any `IAuthenticator` implementation in DI.
 
@@ -188,6 +199,9 @@ builder.Services.AddHealthChecks().AddSmppServerHealthCheck();
 ```
 
 ## Build & test
+
+The PDU codec is pulled in as a git submodule (`external/Elyfe.Smpp`), so clone with
+`--recursive` or run `git submodule update --init --recursive` first.
 
 ```bash
 dotnet build Elyfe.Smpp.Server.slnx

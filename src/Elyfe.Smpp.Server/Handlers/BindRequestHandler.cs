@@ -50,7 +50,8 @@ public static class BindRequestHandler
             return;
         }
 
-        if (!ctx.CanBindSystemId(request.SystemID))
+        // Reserved before the asynchronous authentication so concurrent binds cannot all pass the cap check.
+        if (!ctx.TryReserveSystemId(request.SystemID))
         {
             ctx.Logger.LogWarning(
                 "Bind rejected for system_id {SystemId}: per-system_id connection cap reached",
@@ -78,6 +79,7 @@ public static class BindRequestHandler
                 ctx.SessionId, request.SystemID);
             response.Header.ErrorCode = SmppErrorCode.ESME_RSYSERR;
             ctx.Metrics.RecordBind("auth_error");
+            ctx.ReleaseSystemId();
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -88,6 +90,7 @@ public static class BindRequestHandler
                 request.SystemID, auth.FailureReason);
             response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
             ctx.Metrics.RecordBind("auth_failed");
+            ctx.ReleaseSystemId();
             await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
             return;
         }

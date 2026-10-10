@@ -103,6 +103,156 @@ public class SmppServerIntegrationTests
         await server.StopAsync(cts.Token);
     }
 
+    private async Task<SmppPduChannel> BindTransceiverAsync(TcpClient client, int port, CancellationToken ct)
+    {
+        await client.ConnectAsync(IPAddress.Loopback, port, ct);
+        var channel = new SmppPduChannel(client.GetStream(), _encoding);
+
+        var bind = (BindTransceiver)PDU.CreatePDU(new PDUHeader(CommandType.BindTransceiver, 1), _encoding);
+        bind.SystemID = "esme01";
+        bind.Password = "secret";
+        bind.InterfaceVersion = 0x34;
+        await channel.WriteAsync(bind, ct);
+
+        var bindResp = await channel.ReadAsync(ct);
+        Assert.Equal(SmppErrorCode.ESME_ROK, bindResp!.Value.Header.ErrorCode);
+        return channel;
+    }
+
+    private static SmppDeliverRequest Deliver(string message) => new()
+    {
+        TenantId = "tenant-x",
+        SourceAddress = "233200000000",
+        DestinationAddress = "1234",
+        Message = message
+    };
+
+    [Fact]
+    public async Task Deliver_ReportsEsmeAcknowledgement_AndDoesNotNackResponses()
+    {
+        var options = new SmppServerOptions
+        {
+            Port = GetFreePort(),
+            BindAddress = "127.0.0.1",
+            ShutdownDrainTimeout = TimeSpan.FromMilliseconds(200) // This client never answers the shutdown unbind.
+        };
+        await using var server = BuildServer(options, new FakeMessageHandler());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await server.StartAsync(cts.Token);
+
+        using var client = new TcpClient();
+        var channel = await BindTransceiverAsync(client, options.Port, cts.Token);
+
+        // Acknowledged delivery, with non-ASCII text arriving intact.
+        var accepted = server.DeliverAsync(Deliver("Olá — Ωmega ✓"), cts.Token);
+        var first = Assert.IsType<DeliverSm>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        Assert.Equal("Olá — Ωmega ✓", first.GetMessageText());
+        Assert.False(accepted.IsCompleted);
+        await channel.WriteAsync(first.CreateDefaultResponse(), cts.Token);
+        Assert.True(await accepted);
+
+        // Rejected delivery surfaces as a failure.
+        var rejected = server.DeliverAsync(Deliver("second"), cts.Token);
+        var second = Assert.IsType<DeliverSm>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        var errorResp = second.CreateDefaultResponse();
+        errorResp.Header.ErrorCode = SmppErrorCode.ESME_RSYSERR;
+        await channel.WriteAsync(errorResp, cts.Token);
+        Assert.False(await rejected);
+
+        // An unsolicited enquire_link_resp is ignored; the next frame is our enquire_link_resp, not a generic_nack.
+        await channel.WriteAsync(PDU.CreatePDU(new PDUHeader(CommandType.EnquireLinkResp, 99), _encoding), cts.Token);
+        await channel.WriteAsync(PDU.CreatePDU(new PDUHeader(CommandType.EnquireLink, 7), _encoding), cts.Token);
+        var next = await channel.ReadAsync(cts.Token);
+        Assert.Equal(CommandType.EnquireLinkResp, next!.Value.Header.CommandType);
+        Assert.Equal(7u, next.Value.Header.SequenceNumber);
+
+        await server.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Deliver_HonoursWindow_AndFailsWhenEsmeNeverRespondsOrDisconnects()
+    {
+        var options = new SmppServerOptions
+        {
+            Port = GetFreePort(),
+            BindAddress = "127.0.0.1",
+            WindowSize = 1
+        };
+        await using var server = BuildServer(options, new FakeMessageHandler());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await server.StartAsync(cts.Token);
+
+        using var client = new TcpClient();
+        var channel = await BindTransceiverAsync(client, options.Port, cts.Token);
+
+        // The first delivery occupies the single window slot, so the second stays off the wire until it is answered.
+        var first = server.DeliverAsync(Deliver("one"), cts.Token);
+        var one = Assert.IsType<DeliverSm>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        var second = server.DeliverAsync(Deliver("two"), cts.Token);
+        await Task.Delay(150, cts.Token);
+        Assert.Equal(0, client.Available);
+        await channel.WriteAsync(one.CreateDefaultResponse(), cts.Token);
+        Assert.True(await first);
+        var two = Assert.IsType<DeliverSm>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        Assert.Equal("two", two.GetMessageText());
+        await channel.WriteAsync(two.CreateDefaultResponse(), cts.Token);
+        Assert.True(await second);
+
+        // No deliver_sm_resp within the timeout is a failure.
+        options.DeliverResponseTimeout = TimeSpan.FromMilliseconds(200);
+        var third = server.DeliverAsync(Deliver("three"), cts.Token);
+        Assert.IsType<DeliverSm>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        Assert.False(await third);
+
+        // So is a disconnect with a delivery outstanding.
+        options.DeliverResponseTimeout = TimeSpan.FromSeconds(30);
+        var fourth = server.DeliverAsync(Deliver("four"), cts.Token);
+        Assert.IsType<DeliverSm>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        client.Close();
+        Assert.False(await fourth);
+
+        await server.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Stop_UnbindsBoundSessions_AfterCompletingInFlightSubmit()
+    {
+        var options = new SmppServerOptions { Port = GetFreePort(), BindAddress = "127.0.0.1" };
+        var release = new TaskCompletionSource<SmppSubmitResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new FakeMessageHandler { PendingSubmit = release.Task };
+        await using var server = BuildServer(options, handler);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await server.StartAsync(cts.Token);
+
+        using var client = new TcpClient();
+        var channel = await BindTransceiverAsync(client, options.Port, cts.Token);
+
+        var submit = (SubmitSm)PDU.CreatePDU(new PDUHeader(CommandType.SubmitSm, 2), _encoding);
+        submit.SourceAddress.Address = "1234";
+        submit.DestinationAddress.Address = "233200000000";
+        submit.SetMessageText("in flight", DataCoding.ASCII);
+        await channel.WriteAsync(submit, cts.Token);
+        await handler.SubmitStarted.Task.WaitAsync(cts.Token);
+
+        var stop = server.StopAsync(CancellationToken.None);
+
+        var unbind = await channel.ReadAsync(cts.Token);
+        Assert.Equal(CommandType.UnBind, unbind!.Value.Header.CommandType);
+        await channel.WriteAsync(
+            PDU.CreatePDU(new PDUHeader(CommandType.UnBindResp, unbind.Value.Header.SequenceNumber), _encoding),
+            cts.Token);
+
+        // The submit awaiting the platform still gets its response rather than a dropped connection.
+        Assert.False(stop.IsCompleted);
+        release.SetResult(SmppSubmitResult.Success("drained-1"));
+        var submitResp = Assert.IsType<SubmitSmResp>((await channel.ReadAsync(cts.Token))!.Value.Pdu);
+        Assert.Equal(SmppErrorCode.ESME_ROK, submitResp.Header.ErrorCode);
+        Assert.Equal("drained-1", submitResp.MessageID);
+
+        await stop.WaitAsync(cts.Token);
+        Assert.Null(await channel.ReadAsync(cts.Token));
+    }
+
     [Fact]
     public async Task SubmitBeforeBind_IsRejected()
     {
@@ -143,12 +293,18 @@ internal sealed class FakeMessageHandler : IMessageHandler
 {
     public SmppSubmitResult SubmitResult { get; set; } = SmppSubmitResult.Failure("not configured");
 
+    /// <summary>When set, submits complete only when this task does.</summary>
+    public Task<SmppSubmitResult>? PendingSubmit { get; set; }
+
+    public TaskCompletionSource SubmitStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public SmppSubmitRequest? LastSubmit { get; private set; }
 
     public Task<SmppSubmitResult> HandleSubmitAsync(SmppSubmitRequest request, CancellationToken cancellationToken = default)
     {
         LastSubmit = request;
-        return Task.FromResult(SubmitResult);
+        SubmitStarted.TrySetResult();
+        return PendingSubmit ?? Task.FromResult(SubmitResult);
     }
 
     public Task<byte?> QueryMessageStateAsync(string tenantId, string messageId, CancellationToken cancellationToken = default)

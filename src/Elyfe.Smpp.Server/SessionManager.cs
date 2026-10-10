@@ -11,6 +11,8 @@ namespace Elyfe.Smpp.Server;
 public sealed class SessionManager
 {
     private readonly ConcurrentDictionary<string, SmppServerSession> _sessions = new();
+    private readonly object _gate = new();
+    private int _reservedSlots;
     private readonly SmppServerOptions _options;
     private readonly ILogger<SessionManager> _logger;
 
@@ -25,35 +27,90 @@ public sealed class SessionManager
     public int Count => _sessions.Count;
 
     /// <summary>
-    ///     Attempts to register a newly accepted session. Returns <c>false</c> when the global session limit has been
-    ///     reached, in which case the caller should close the connection.
+    ///     Atomically reserves a connection slot against <see cref="SmppServerOptions.MaxSessions" /> for a newly
+    ///     accepted connection. The slot is held from accept (before any TLS handshake) until
+    ///     <see cref="ReleaseSlot" /> is called. Returns <c>false</c> when the global limit has been reached, in which
+    ///     case the caller should close the connection.
     /// </summary>
-    public bool TryRegister(SmppServerSession session)
+    public bool TryReserveSlot()
     {
-        if (_sessions.Count >= _options.MaxSessions)
+        lock (_gate)
         {
-            _logger.LogWarning("Rejecting connection {SessionId}: max sessions ({Max}) reached",
-                session.SessionId, _options.MaxSessions);
-            return false;
-        }
+            if (_options.MaxSessions > 0 && _reservedSlots >= _options.MaxSessions)
+            {
+                _logger.LogWarning("Rejecting connection: max sessions ({Max}) reached", _options.MaxSessions);
+                return false;
+            }
 
-        return _sessions.TryAdd(session.SessionId, session);
+            _reservedSlots++;
+            return true;
+        }
     }
 
-    /// <summary>Removes a session from the registry.</summary>
+    /// <summary>Releases a slot previously obtained from <see cref="TryReserveSlot" />.</summary>
+    public void ReleaseSlot()
+    {
+        lock (_gate)
+        {
+            if (_reservedSlots > 0)
+            {
+                _reservedSlots--;
+            }
+        }
+    }
+
+    /// <summary>Adds a session to the registry. The caller must already hold a slot for it.</summary>
+    public void Register(SmppServerSession session) => _sessions[session.SessionId] = session;
+
+    /// <summary>Removes a session from the registry, releasing any <c>system_id</c> reservation it holds.</summary>
     public void Remove(SmppServerSession session) => _sessions.TryRemove(session.SessionId, out _);
 
     /// <summary>
-    ///     Returns the number of bound sessions sharing the supplied <c>system_id</c>. Used to enforce the
-    ///     per-system_id connection cap.
+    ///     Returns the number of registered sessions bound, or in the process of binding, under the supplied
+    ///     <c>system_id</c>.
     /// </summary>
     public int CountBySystemId(string systemId)
         => _sessions.Values.Count(s =>
-            string.Equals(s.SystemId, systemId, StringComparison.OrdinalIgnoreCase));
+            string.Equals(s.ReservedSystemId, systemId, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    ///     Atomically checks the per-<c>system_id</c> cap and, when there is room, reserves a place for
+    ///     <paramref name="session" /> under <paramref name="systemId" />. The reservation is taken before
+    ///     authentication so concurrent binds cannot all pass the check, and is dropped by
+    ///     <see cref="ReleaseSystemId" /> or when the session is removed.
+    /// </summary>
+    public bool TryReserveSystemId(SmppServerSession session, string systemId)
+    {
+        lock (_gate)
+        {
+            if (_options.MaxSessionsPerSystemId > 0)
+            {
+                var others = _sessions.Values.Count(s =>
+                    !ReferenceEquals(s, session)
+                    && string.Equals(s.ReservedSystemId, systemId, StringComparison.OrdinalIgnoreCase));
+                if (others >= _options.MaxSessionsPerSystemId)
+                {
+                    return false;
+                }
+            }
+
+            session.ReservedSystemId = systemId;
+            return true;
+        }
+    }
+
+    /// <summary>Drops the <c>system_id</c> reservation held by a session whose bind did not complete.</summary>
+    public void ReleaseSystemId(SmppServerSession session)
+    {
+        lock (_gate)
+        {
+            session.ReservedSystemId = null;
+        }
+    }
 
     /// <summary>
     ///     Delivers a mobile-originated message or delivery receipt to a bound receiver/transceiver session for the
-    ///     target tenant. Returns <c>true</c> when at least one session accepted the delivery.
+    ///     target tenant. Returns <c>true</c> when the ESME on one of those sessions acknowledged the delivery.
     /// </summary>
     public async Task<bool> DeliverToTenantAsync(SmppDeliverRequest request, CancellationToken cancellationToken)
     {
@@ -104,7 +161,25 @@ public sealed class SessionManager
         }
     }
 
-    /// <summary>Gracefully disposes all tracked sessions during shutdown.</summary>
+    /// <summary>
+    ///     Sends <c>unbind</c> to every bound session and waits, up to <paramref name="timeout" />, for each to finish
+    ///     its in-flight exchange and acknowledge. Sessions still open afterwards are left for
+    ///     <see cref="CloseAllAsync" />.
+    /// </summary>
+    public async Task DrainAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var sessions = _sessions.Values.ToList();
+        if (sessions.Count == 0 || timeout <= TimeSpan.Zero)
+        {
+            return;
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(timeout);
+        await Task.WhenAll(sessions.Select(s => s.UnbindAsync(cts.Token))).ConfigureAwait(false);
+    }
+
+    /// <summary>Disposes all tracked sessions during shutdown.</summary>
     public async Task CloseAllAsync()
     {
         foreach (var session in _sessions.Values)

@@ -26,6 +26,7 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
 
     private TcpIpListener? _listener;
     private CancellationTokenSource? _stoppingCts;
+    private CancellationTokenSource? _sessionsCts;
     private Task? _acceptLoop;
     private Task? _idleSweepLoop;
     private X509Certificate2? _tlsCertificate;
@@ -70,7 +71,9 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
                 _options.Tls.CertificatePath,
                 _options.Tls.CertificatePassword);        }
 
+        // Sessions get their own token so shutdown can stop accepting first and drain them before cancelling.
         _stoppingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _sessionsCts = new CancellationTokenSource();
         _listener = new TcpIpListener(_options.BindAddress, _options.Port);
         _listener.Start();
 
@@ -106,20 +109,19 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
             await SafeAwaitAsync(_idleSweepLoop).ConfigureAwait(false);
         }
 
+        // Let bound sessions finish in-flight exchanges and acknowledge an unbind before dropping connections.
+        if (_sessionsCts is { IsCancellationRequested: false })
+        {
+            await _sessionManager.DrainAsync(_options.ShutdownDrainTimeout, cancellationToken).ConfigureAwait(false);
+            await _sessionsCts.CancelAsync().ConfigureAwait(false);
+        }
+
         await _sessionManager.CloseAllAsync().ConfigureAwait(false);
     }
 
     /// <inheritdoc />
     public Task<bool> DeliverAsync(SmppDeliverRequest request, CancellationToken cancellationToken)
         => _sessionManager.DeliverToTenantAsync(request, cancellationToken);
-
-    /// <summary>
-    ///     Per-<c>system_id</c> connection-cap predicate passed to each session. Returns <c>true</c> when another
-    ///     session may bind under <paramref name="systemId" /> without exceeding <see cref="SmppServerOptions.MaxSessionsPerSystemId" />.
-    /// </summary>
-    private bool CanBindSystemId(string systemId)
-        => _options.MaxSessionsPerSystemId <= 0
-           || _sessionManager.CountBySystemId(systemId) < _options.MaxSessionsPerSystemId;
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
     {
@@ -140,12 +142,20 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
                 continue;
             }
 
-            _ = Task.Run(() => HandleConnectionAsync(socket, cancellationToken), CancellationToken.None);
+            var sessionsToken = _sessionsCts!.Token;
+            _ = Task.Run(() => HandleConnectionAsync(socket, sessionsToken), CancellationToken.None);
         }
     }
 
     private async Task HandleConnectionAsync(Socket socket, CancellationToken cancellationToken)
     {
+        // The slot is held from accept, so connections stalled in the TLS handshake count against MaxSessions.
+        if (!_sessionManager.TryReserveSlot())
+        {
+            socket.Dispose();
+            return;
+        }
+
         SmppServerSession? session = null;
         try
         {
@@ -159,14 +169,9 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
                 _messageHandler,
                 _loggerFactory.CreateLogger<SmppServerSession>(),
                 _metrics,
-                CanBindSystemId);
+                _sessionManager);
 
-            if (!_sessionManager.TryRegister(session))
-            {
-                await session.DisposeAsync().ConfigureAwait(false);
-                return;
-            }
-
+            _sessionManager.Register(session);
             await session.RunAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -184,6 +189,8 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
             {
                 socket.Dispose();
             }
+
+            _sessionManager.ReleaseSlot();
         }
     }
 
@@ -195,14 +202,30 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
             return stream;
         }
 
+        // Bound the handshake so a client that connects and stalls cannot hold the socket indefinitely.
+        using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (_options.BindTimeout > TimeSpan.Zero)
+        {
+            handshakeCts.CancelAfter(_options.BindTimeout);
+        }
+
         var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
-        await sslStream.AuthenticateAsServerAsync(
-            new SslServerAuthenticationOptions
-            {
-                ServerCertificate = _tlsCertificate,
-                ClientCertificateRequired = false
-            },
-            cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await sslStream.AuthenticateAsServerAsync(
+                new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = _tlsCertificate,
+                    ClientCertificateRequired = false
+                },
+                handshakeCts.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            await sslStream.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+
         return sslStream;
     }
 
@@ -247,6 +270,7 @@ public sealed class SmppServer : ISmppServer, IAsyncDisposable
     {
         await StopAsync(CancellationToken.None).ConfigureAwait(false);
         _stoppingCts?.Dispose();
+        _sessionsCts?.Dispose();
         _listener?.Dispose();
         _tlsCertificate?.Dispose();
     }

@@ -117,6 +117,31 @@ public class AuthenticatorTests
             File.Delete(path);
         }
     }
+
+    [Fact]
+    public async Task FileAuthenticator_RevokesAccountsWhenFileIsDeleted_AndReloadsWhenRestored()
+    {
+        const string json = """[{ "systemId": "esme-file", "password": "filepass", "tenantId": "tenant-f" }]""";
+        var path = Path.Combine(Path.GetTempPath(), $"smpp-accounts-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(path, json);
+        try
+        {
+            var authenticator = new FileBasedAuthenticator(
+                new FileAuthenticatorOptions { FilePath = path },
+                NullLogger<FileBasedAuthenticator>.Instance);
+            Assert.True((await authenticator.AuthenticateAsync(Credentials("esme-file", "filepass"), CancellationToken.None)).Succeeded);
+
+            File.Delete(path);
+            Assert.False((await authenticator.AuthenticateAsync(Credentials("esme-file", "filepass"), CancellationToken.None)).Succeeded);
+
+            await File.WriteAllTextAsync(path, json);
+            Assert.True((await authenticator.AuthenticateAsync(Credentials("esme-file", "filepass"), CancellationToken.None)).Succeeded);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
 }
 
 /// <summary>A minimal <see cref="IOptionsMonitor{T}" /> returning a fixed value for tests.</summary>

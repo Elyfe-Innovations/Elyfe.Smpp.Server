@@ -60,10 +60,14 @@ public interface ISmppSessionContext
     void MarkBound(SmppBindMode mode, string systemId, string tenantId, byte interfaceVersion);
 
     /// <summary>
-    ///     Returns <c>true</c> when a new session may bind under the supplied <c>system_id</c> without exceeding the
-    ///     configured per-<c>system_id</c> connection cap.
+    ///     Reserves a place for this session under the supplied <c>system_id</c>. Returns <c>false</c> when the
+    ///     configured per-<c>system_id</c> connection cap is already reached. Call
+    ///     <see cref="ReleaseSystemId" /> if the bind subsequently fails.
     /// </summary>
-    bool CanBindSystemId(string systemId);
+    bool TryReserveSystemId(string systemId);
+
+    /// <summary>Drops the reservation taken by <see cref="TryReserveSystemId" /> after a failed bind.</summary>
+    void ReleaseSystemId();
 
     /// <summary>Begins the unbind / close sequence.</summary>
     void MarkUnbound();
