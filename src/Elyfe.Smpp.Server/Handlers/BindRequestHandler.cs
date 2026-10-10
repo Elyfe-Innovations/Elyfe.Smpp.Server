@@ -1,6 +1,7 @@
 using Elyfe.Smpp.Server.Authentication;
 using JamaaTech.Smpp.Net.Lib;
 using JamaaTech.Smpp.Net.Lib.Protocol;
+using JamaaTech.Smpp.Net.Lib.Protocol.Tlv;
 using Microsoft.Extensions.Logging;
 
 namespace Elyfe.Smpp.Server.Handlers;
@@ -25,7 +26,7 @@ public static class BindRequestHandler
             ctx.Logger.LogWarning("Bind rejected for session {SessionId}: already bound", ctx.SessionId);
             response.Header.ErrorCode = SmppErrorCode.ESME_RALYBND;
             ctx.Metrics.RecordBind("already_bound");
-            await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -38,7 +39,7 @@ public static class BindRequestHandler
                 version);
             response.Header.ErrorCode = SmppErrorCode.ESME_RINVBNDSTS;
             ctx.Metrics.RecordBind("bad_version");
-            await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -46,7 +47,7 @@ public static class BindRequestHandler
         {
             response.Header.ErrorCode = SmppErrorCode.ESME_RINVSYSID;
             ctx.Metrics.RecordBind("missing_system_id");
-            await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -58,7 +59,7 @@ public static class BindRequestHandler
                 request.SystemID);
             response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
             ctx.Metrics.RecordBind("cap_reached");
-            await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -80,7 +81,7 @@ public static class BindRequestHandler
             response.Header.ErrorCode = SmppErrorCode.ESME_RSYSERR;
             ctx.Metrics.RecordBind("auth_error");
             ctx.ReleaseSystemId();
-            await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -91,7 +92,7 @@ public static class BindRequestHandler
             response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
             ctx.Metrics.RecordBind("auth_failed");
             ctx.ReleaseSystemId();
-            await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -103,6 +104,14 @@ public static class BindRequestHandler
         };
 
         ctx.MarkBound(mode, request.SystemID, auth.TenantId, version);
+
+        // SMPP v5.0 §2.11.2: the MC should advertise its version so the ESME knows TLVs are supported, but must not
+        // send TLVs to an ESME that bound with a pre-v3.4 interface_version.
+        if (version >= (byte)SmppInterfaceVersion.V34)
+        {
+            response.SetOptionalParamByte<byte>(Tag.SC_interface_version, ctx.Options.MaxInterfaceVersion);
+        }
+
         response.Header.ErrorCode = SmppErrorCode.ESME_ROK;
         ctx.Metrics.RecordBind("ok");
         await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
@@ -110,5 +119,17 @@ public static class BindRequestHandler
         ctx.Logger.LogInformation(
             "Session {SessionId} bound as {Mode} for system_id {SystemId} (tenant {TenantId}, v0x{Version:X2})",
             ctx.SessionId, mode, request.SystemID, auth.TenantId, version);
+    }
+
+    /// <summary>
+    ///     Sends a failed bind response as a header only: per SMPP v3.4 §4.1.2 the body (the SMSC
+    ///     <c>system_id</c>) is not returned when <c>command_status</c> is non-zero.
+    /// </summary>
+    private static Task SendErrorAsync(ISmppSessionContext ctx, BindResponse response, CancellationToken cancellationToken)
+    {
+        const uint headerLength = 16;
+        var header = new PDUHeader(
+            response.Header.CommandType, response.Header.SequenceNumber, response.Header.ErrorCode, headerLength);
+        return ctx.SendRawAsync(header.GetBytes(ctx.Encoding), cancellationToken);
     }
 }

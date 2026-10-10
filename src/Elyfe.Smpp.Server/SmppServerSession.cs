@@ -144,6 +144,11 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
                 catch (InvalidDataException ex)
                 {
                     Logger.LogWarning(ex, "Session {SessionId} closed: malformed PDU", SessionId);
+
+                    // SMPP v3.4 §4.3: an invalid command_length must be answered with a generic_nack. The stream can
+                    // no longer be framed, so the sequence number is NULL and the connection is then closed.
+                    var lengthNack = GenericNackHandler.Build(Encoding, 0, SmppErrorCode.ESME_RINVCMDLEN);
+                    await SendAsync(lengthNack, cancellationToken).ConfigureAwait(false);
                     break;
                 }
 
@@ -275,7 +280,7 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
                 return false;
             }
 
-            var deliver = DeliverSmDispatcher.Build(request, Encoding, sequenceNumber.Value);
+            var deliver = DeliverSmDispatcher.Build(request, Encoding, sequenceNumber.Value, InterfaceVersion);
             await SendAsync(deliver, timeoutCts.Token).ConfigureAwait(false);
 
             var status = await pending.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);

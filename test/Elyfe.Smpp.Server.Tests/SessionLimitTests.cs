@@ -5,6 +5,7 @@ using Elyfe.Smpp.Server.Handlers;
 using Elyfe.Smpp.Server.Networking;
 using JamaaTech.Smpp.Net.Lib;
 using JamaaTech.Smpp.Net.Lib.Protocol;
+using JamaaTech.Smpp.Net.Lib.Protocol.Tlv;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -126,15 +127,84 @@ public class SessionLimitTests
         Assert.Equal(text, parsed.GetMessageText());
     }
 
-    private static async Task<DeliverSm> RoundTripAsync(string text)
+    [Fact]
+    public async Task DeliverSm_LongText_UsesMessagePayloadWithZeroSmLength()
+    {
+        var request = Request(new string('a', 255));
+
+        var bytes = DeliverSmDispatcher.Build(request, Encoding, 1).GetBytes();
+        var parsed = await ParseAsync(bytes);
+
+        // sm_length must be 0 and the body must not be duplicated in short_message (v3.4 §4.6.1, §5.2.21).
+        var payload = parsed.Tlv.GetTlvByTag(Tag.message_payload);
+        Assert.NotNull(payload);
+        Assert.Equal(255, payload!.RawValue.Length);
+        const int smLengthOffset = 16 + 1 + 15 + 7 + 9; // header, service_type, source, destination, nine fixed fields
+        Assert.Equal(0, bytes[smLengthOffset]);
+        Assert.Equal(new byte[] { 0x04, 0x24, 0x00, 0xFF }, bytes[(smLengthOffset + 1)..(smLengthOffset + 5)]);
+        Assert.Equal(smLengthOffset + 1 + 4 + 255, bytes.Length);
+    }
+
+    [Fact]
+    public async Task DeliverSm_Receipt_CarriesReceiptedMessageIdAndMessageState()
     {
         var request = new SmppDeliverRequest
         {
             TenantId = "t",
             SourceAddress = "233200000000",
             DestinationAddress = "1234",
-            Message = text
+            Message = "id:abc123 stat:DELIVRD",
+            IsDeliveryReceipt = true,
+            ReceiptedMessageId = "abc123",
+            MessageState = 2
         };
+
+        var parsed = await ParseAsync(DeliverSmDispatcher.Build(request, Encoding, 1).GetBytes());
+
+        Assert.Equal(EsmClass.DeliveryReceipt, parsed.EsmClass);
+        Assert.Equal("abc123", parsed.GetOptionalParamCString(Tag.receipted_message_id));
+        Assert.Equal((byte)2, parsed.GetOptionalParamByte(Tag.message_state));
+    }
+
+    [Fact]
+    public async Task DeliverSm_ToPreV34Esme_NeverCarriesTlvs()
+    {
+        const byte v33 = 0x33;
+        var receipt = new SmppDeliverRequest
+        {
+            TenantId = "t",
+            SourceAddress = "233200000000",
+            DestinationAddress = "1234",
+            Message = "id:abc123 stat:DELIVRD",
+            IsDeliveryReceipt = true,
+            ReceiptedMessageId = "abc123",
+            MessageState = 2
+        };
+
+        var parsed = await ParseAsync(DeliverSmDispatcher.Build(receipt, Encoding, 1, v33).GetBytes());
+
+        Assert.Empty(parsed.Tlv);
+        Assert.Throws<InvalidOperationException>(
+            () => DeliverSmDispatcher.Build(Request(new string('a', 255)), Encoding, 1, v33));
+    }
+
+    private static SmppDeliverRequest Request(string text) => new()
+    {
+        TenantId = "t",
+        SourceAddress = "233200000000",
+        DestinationAddress = "1234",
+        Message = text
+    };
+
+    private static async Task<DeliverSm> ParseAsync(byte[] bytes)
+    {
+        var frame = await new SmppPduChannel(new MemoryStream(bytes), Encoding).ReadAsync(CancellationToken.None);
+        return Assert.IsType<DeliverSm>(frame!.Value.Pdu);
+    }
+
+    private static async Task<DeliverSm> RoundTripAsync(string text)
+    {
+        var request = Request(text);
         var bytes = DeliverSmDispatcher.Build(request, Encoding, 1).GetBytes();
         var frame = await new SmppPduChannel(new MemoryStream(bytes), Encoding).ReadAsync(CancellationToken.None);
         return Assert.IsType<DeliverSm>(frame!.Value.Pdu);

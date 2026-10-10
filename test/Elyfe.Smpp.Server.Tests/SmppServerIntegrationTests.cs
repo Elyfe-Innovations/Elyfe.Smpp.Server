@@ -5,6 +5,7 @@ using Elyfe.Smpp.Server.Bridge;
 using Elyfe.Smpp.Server.Networking;
 using JamaaTech.Smpp.Net.Lib;
 using JamaaTech.Smpp.Net.Lib.Protocol;
+using JamaaTech.Smpp.Net.Lib.Protocol.Tlv;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -71,6 +72,7 @@ public class SmppServerIntegrationTests
         var bindRespPdu = Assert.IsType<BindTransmitterResp>(bindResp!.Value.Pdu);
         Assert.Equal(SmppErrorCode.ESME_ROK, bindRespPdu.Header.ErrorCode);
         Assert.Equal("TestSMSC", bindRespPdu.SystemID);
+        Assert.Equal((byte)0x50, bindRespPdu.GetOptionalParamByte(Tag.SC_interface_version));
 
         // --- submit_sm ---
         var submit = (SubmitSm)PDU.CreatePDU(new PDUHeader(CommandType.SubmitSm, 2), _encoding);
@@ -101,6 +103,40 @@ public class SmppServerIntegrationTests
         Assert.Equal(CommandType.UnBindResp, unbindResp!.Value.Header.CommandType);
 
         await server.StopAsync(cts.Token);
+    }
+
+    [Fact]
+    public async Task FailedBind_ReturnsHeaderOnlyResponse_AndBadLengthGetsGenericNack()
+    {
+        var options = new SmppServerOptions { Port = GetFreePort(), BindAddress = "127.0.0.1", SystemId = "TestSMSC" };
+        await using var server = BuildServer(options, new FakeMessageHandler());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await server.StartAsync(cts.Token);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, options.Port, cts.Token);
+        var stream = client.GetStream();
+        var channel = new SmppPduChannel(stream, _encoding);
+
+        var bind = (BindTransmitter)PDU.CreatePDU(new PDUHeader(CommandType.BindTransmitter, 5), _encoding);
+        bind.SystemID = "esme01";
+        bind.Password = "wrong";
+        bind.InterfaceVersion = 0x34;
+        await channel.WriteAsync(bind, cts.Token);
+
+        // v3.4 §4.1.2: the body (system_id) is not returned when command_status is non-zero.
+        var resp = (await channel.ReadAsync(cts.Token))!.Value;
+        Assert.Equal(CommandType.BindTransmitterResp, resp.Header.CommandType);
+        Assert.Equal(SmppErrorCode.ESME_RBINDFAIL, resp.Header.ErrorCode);
+        Assert.Equal(5u, resp.Header.SequenceNumber);
+        Assert.Equal(16u, resp.Header.CommandLength);
+
+        // v3.4 §4.3: an invalid command_length is answered with a generic_nack before the connection closes.
+        await stream.WriteAsync(new byte[] { 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9 }, cts.Token);
+        var nack = (await channel.ReadAsync(cts.Token))!.Value;
+        Assert.Equal(CommandType.GenericNack, nack.Header.CommandType);
+        Assert.Equal(SmppErrorCode.ESME_RINVCMDLEN, nack.Header.ErrorCode);
+        Assert.Null(await channel.ReadAsync(cts.Token));
     }
 
     private async Task<SmppPduChannel> BindTransceiverAsync(TcpClient client, int port, CancellationToken ct)
