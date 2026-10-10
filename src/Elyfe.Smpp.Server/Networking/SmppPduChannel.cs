@@ -31,7 +31,8 @@ public sealed class SmppPduChannel
     /// </summary>
     /// <returns>
     ///     The parsed <see cref="SmppFrame" />, or <c>null</c> when the peer closed the connection. The frame's
-    ///     <see cref="SmppFrame.Pdu" /> is <c>null</c> when the command id is not recognised by the PDU library.
+    ///     <see cref="SmppFrame.Pdu" /> is <c>null</c> when the command id is not recognised by the PDU library, or
+    ///     when the body of a recognised command is malformed (<see cref="SmppFrame.ParseError" /> is then set).
     /// </returns>
     public async Task<SmppFrame?> ReadAsync(CancellationToken cancellationToken)
     {
@@ -58,10 +59,14 @@ public sealed class SmppPduChannel
         var pduHeader = PDUHeader.Parse(headerBuffer, _encoding);
 
         PDU? pdu = null;
+        SmppErrorCode? parseError = null;
         try
         {
             pdu = PDU.CreatePDU(pduHeader, _encoding);
-            if (bodyLength > 0)
+
+            // A request is parsed even when its body is empty so that missing mandatory fields are reported; a
+            // response may legitimately be header-only when it carries an error status.
+            if (bodyLength > 0 || pdu is RequestPDU)
             {
                 pdu.SetBodyData(new ByteBuffer(body));
             }
@@ -71,8 +76,14 @@ public sealed class SmppPduChannel
             // Unrecognised command id (e.g. SMPP v5.0 broadcast_sm). The session handles it from the header.
             pdu = null;
         }
+        catch (PDUException ex)
+        {
+            // The frame itself is intact, so the stream stays in sync and the session can answer from the header.
+            pdu = null;
+            parseError = ex.ErrorCode;
+        }
 
-        return new SmppFrame(pduHeader, pdu, body);
+        return new SmppFrame(pduHeader, pdu, body, parseError);
     }
 
     /// <summary>

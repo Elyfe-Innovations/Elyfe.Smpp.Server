@@ -63,6 +63,13 @@ public sealed class SmppServerOptions
     public byte MaxInterfaceVersion { get; set; } = 0x50;
 
     /// <summary>
+    ///     SMPP version reported to ESMEs in the <c>sc_interface_version</c> TLV of a successful bind response.
+    ///     Defaults to <c>0x34</c> because the v5.0-only operations (e.g. broadcast) are not implemented; v5.0 ESMEs
+    ///     may still bind up to <see cref="MaxInterfaceVersion" />.
+    /// </summary>
+    public byte AdvertisedInterfaceVersion { get; set; } = 0x34;
+
+    /// <summary>
     ///     Per-session inbound submit rate limit (messages/second). Zero or negative disables throttling.
     /// </summary>
     public int MaxSubmitsPerSecond { get; set; } = 100;

@@ -72,7 +72,7 @@ public class SmppServerIntegrationTests
         var bindRespPdu = Assert.IsType<BindTransmitterResp>(bindResp!.Value.Pdu);
         Assert.Equal(SmppErrorCode.ESME_ROK, bindRespPdu.Header.ErrorCode);
         Assert.Equal("TestSMSC", bindRespPdu.SystemID);
-        Assert.Equal((byte)0x50, bindRespPdu.GetOptionalParamByte(Tag.SC_interface_version));
+        Assert.Equal((byte)0x34, bindRespPdu.GetOptionalParamByte(Tag.SC_interface_version));
 
         // --- submit_sm ---
         var submit = (SubmitSm)PDU.CreatePDU(new PDUHeader(CommandType.SubmitSm, 2), _encoding);
@@ -137,6 +137,116 @@ public class SmppServerIntegrationTests
         Assert.Equal(CommandType.GenericNack, nack.Header.CommandType);
         Assert.Equal(SmppErrorCode.ESME_RINVCMDLEN, nack.Header.ErrorCode);
         Assert.Null(await channel.ReadAsync(cts.Token));
+    }
+
+    [Fact]
+    public async Task UnsupportedInterfaceVersion_IsRejectedWithBindFail()
+    {
+        var options = new SmppServerOptions { Port = GetFreePort(), BindAddress = "127.0.0.1", SystemId = "TestSMSC" };
+        await using var server = BuildServer(options, new FakeMessageHandler());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await server.StartAsync(cts.Token);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, options.Port, cts.Token);
+        var channel = new SmppPduChannel(client.GetStream(), _encoding);
+
+        var bind = (BindTransceiver)PDU.CreatePDU(new PDUHeader(CommandType.BindTransceiver, 3), _encoding);
+        bind.SystemID = "esme01";
+        bind.Password = "secret";
+        bind.InterfaceVersion = 0x33;
+        await channel.WriteAsync(bind, cts.Token);
+
+        var resp = (await channel.ReadAsync(cts.Token))!.Value;
+        Assert.Equal(CommandType.BindTransceiverResp, resp.Header.CommandType);
+        Assert.Equal(SmppErrorCode.ESME_RBINDFAIL, resp.Header.ErrorCode);
+
+        await server.StopAsync(cts.Token);
+    }
+
+    [Fact]
+    public async Task MalformedBody_GetsMatchingErrorResponse_AndSessionStaysUsable()
+    {
+        var options = new SmppServerOptions
+        {
+            Port = GetFreePort(),
+            BindAddress = "127.0.0.1",
+            SystemId = "TestSMSC",
+            ShutdownDrainTimeout = TimeSpan.FromMilliseconds(200)
+        };
+        var handler = new FakeMessageHandler { SubmitResult = SmppSubmitResult.Success("msg-1") };
+        await using var server = BuildServer(options, handler);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await server.StartAsync(cts.Token);
+
+        using var client = new TcpClient();
+        var channel = await BindTransceiverAsync(client, options.Port, cts.Token);
+        var stream = client.GetStream();
+
+        // A submit_sm (0x00000004) whose body is two bytes: far short of its mandatory fields.
+        await stream.WriteAsync(new byte[] { 0, 0, 0, 18, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 7, 0x41, 0 }, cts.Token);
+        var truncated = (await channel.ReadAsync(cts.Token))!.Value;
+        Assert.Equal(CommandType.SubmitSmResp, truncated.Header.CommandType);
+        Assert.NotEqual(SmppErrorCode.ESME_ROK, truncated.Header.ErrorCode);
+        Assert.Equal(7u, truncated.Header.SequenceNumber);
+        Assert.Equal(16u, truncated.Header.CommandLength);
+
+        // A header-only submit_sm is malformed too, not an empty message.
+        await stream.WriteAsync(new byte[] { 0, 0, 0, 16, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 8 }, cts.Token);
+        var empty = (await channel.ReadAsync(cts.Token))!.Value;
+        Assert.Equal(CommandType.SubmitSmResp, empty.Header.CommandType);
+        Assert.NotEqual(SmppErrorCode.ESME_ROK, empty.Header.ErrorCode);
+        Assert.Equal(8u, empty.Header.SequenceNumber);
+        Assert.Null(handler.LastSubmit);
+
+        // The session is still bound and serves the next well-formed request.
+        var submit = (SubmitSm)PDU.CreatePDU(new PDUHeader(CommandType.SubmitSm, 9), _encoding);
+        submit.SourceAddress.Address = "1234";
+        submit.DestinationAddress.Address = "233200000000";
+        submit.SetMessageText("still here", DataCoding.ASCII);
+        await channel.WriteAsync(submit, cts.Token);
+        var ok = (await channel.ReadAsync(cts.Token))!.Value;
+        Assert.Equal(SmppErrorCode.ESME_ROK, ok.Header.ErrorCode);
+        Assert.Equal(9u, ok.Header.SequenceNumber);
+
+        await server.StopAsync(cts.Token);
+    }
+
+    [Fact]
+    public async Task Deliver_IsAcknowledged_WhenResponseBodyCannotBeParsed()
+    {
+        var options = new SmppServerOptions
+        {
+            Port = GetFreePort(),
+            BindAddress = "127.0.0.1",
+            SystemId = "TestSMSC",
+            ShutdownDrainTimeout = TimeSpan.FromMilliseconds(200)
+        };
+        await using var server = BuildServer(options, new FakeMessageHandler());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await server.StartAsync(cts.Token);
+
+        using var client = new TcpClient();
+        var channel = await BindTransceiverAsync(client, options.Port, cts.Token);
+        var stream = client.GetStream();
+
+        var delivery = server.DeliverAsync(Deliver("hello"), cts.Token);
+        var deliver = (await channel.ReadAsync(cts.Token))!.Value;
+        var seq = deliver.Header.SequenceNumber;
+
+        // deliver_sm_resp with a NULL message_id followed by a v5.0 TLV (network_error_code), which the PDU
+        // library does not accept on this PDU.
+        byte[] resp =
+        [
+            0, 0, 0, 24, 0x80, 0, 0, 5, 0, 0, 0, 0,
+            (byte)(seq >> 24), (byte)(seq >> 16), (byte)(seq >> 8), (byte)seq,
+            0, 0x04, 0x23, 0, 3, 3, 0, 0
+        ];
+        await stream.WriteAsync(resp, cts.Token);
+
+        Assert.True(await delivery);
+
+        await server.StopAsync(cts.Token);
     }
 
     private async Task<SmppPduChannel> BindTransceiverAsync(TcpClient client, int port, CancellationToken ct)

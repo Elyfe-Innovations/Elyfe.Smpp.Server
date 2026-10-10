@@ -130,6 +130,7 @@ Bind from the `SmppServer` configuration section:
 | `EnquireLinkInterval` | `00:01:00` | Expected keepalive interval. |
 | `MinInterfaceVersion` | `0x34` (52) | Lowest accepted SMPP version. |
 | `MaxInterfaceVersion` | `0x50` (80) | Highest accepted SMPP version. |
+| `AdvertisedInterfaceVersion` | `0x34` (52) | Version reported in the bind response's `sc_interface_version` TLV. |
 | `MaxSubmitsPerSecond` | `100` | Per-session submit rate limit (0 = off). |
 | `WindowSize` | `100` | Max `deliver_sm` PDUs awaiting `deliver_sm_resp` per session; further deliveries wait (0 = off). |
 | `DeliverResponseTimeout` | `1.00:00:00` | Time a delivery waits for a window slot and `deliver_sm_resp` before it fails. It fails sooner if the session closes or the caller cancels. |

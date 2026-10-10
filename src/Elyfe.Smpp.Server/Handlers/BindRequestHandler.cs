@@ -37,7 +37,9 @@ public static class BindRequestHandler
                 "Bind rejected for session {SessionId}: unsupported interface_version 0x{Version:X2}",
                 ctx.SessionId,
                 version);
-            response.Header.ErrorCode = SmppErrorCode.ESME_RINVBNDSTS;
+            // The spec defines no status for an unsupported version; ESME_RINVBNDSTS would wrongly imply the
+            // session is in the wrong state.
+            response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
             ctx.Metrics.RecordBind("bad_version");
             await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
             return;
@@ -109,7 +111,7 @@ public static class BindRequestHandler
         // send TLVs to an ESME that bound with a pre-v3.4 interface_version.
         if (version >= (byte)SmppInterfaceVersion.V34)
         {
-            response.SetOptionalParamByte<byte>(Tag.SC_interface_version, ctx.Options.MaxInterfaceVersion);
+            response.SetOptionalParamByte<byte>(Tag.SC_interface_version, ctx.Options.AdvertisedInterfaceVersion);
         }
 
         response.Header.ErrorCode = SmppErrorCode.ESME_ROK;

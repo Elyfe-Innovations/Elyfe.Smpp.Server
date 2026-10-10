@@ -1,3 +1,4 @@
+using JamaaTech.Smpp.Net.Lib;
 using JamaaTech.Smpp.Net.Lib.Protocol;
 
 namespace Elyfe.Smpp.Server.Networking;
@@ -8,6 +9,9 @@ namespace Elyfe.Smpp.Server.Networking;
 ///     session can reply appropriately (e.g. SMPP v5.0 broadcast operations or a <c>generic_nack</c>).
 /// </summary>
 /// <param name="Header">The always-parsed 16-byte PDU header.</param>
-/// <param name="Pdu">The fully parsed PDU, or <c>null</c> for an unrecognised command id.</param>
+/// <param name="Pdu">The fully parsed PDU, or <c>null</c> for an unrecognised command id or an unparseable body.</param>
 /// <param name="Body">The raw PDU body bytes following the header.</param>
-public readonly record struct SmppFrame(PDUHeader Header, PDU? Pdu, byte[] Body);
+/// <param name="ParseError">
+///     The status describing why the body of a recognised command could not be parsed, or <c>null</c> when it parsed.
+/// </param>
+public readonly record struct SmppFrame(PDUHeader Header, PDU? Pdu, byte[] Body, SmppErrorCode? ParseError = null);

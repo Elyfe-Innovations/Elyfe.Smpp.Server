@@ -184,6 +184,12 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
 
     private async Task DispatchAsync(SmppFrame frame, CancellationToken cancellationToken)
     {
+        if (frame.ParseError is { } parseError)
+        {
+            await HandleMalformedAsync(frame.Header, parseError, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         if (frame.Pdu is null)
         {
             // Unrecognised command id (e.g. SMPP v5.0 broadcast operations absent from the PDU library).
@@ -220,11 +226,7 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
                 break;
             case DeliverSmResp or GenericNack:
                 // The ESME's answer to a server-originated deliver_sm (a generic_nack carries its sequence number).
-                if (_pendingDeliveries.TryRemove(frame.Header.SequenceNumber, out var pending))
-                {
-                    pending.TrySetResult(frame.Header.ErrorCode);
-                }
-
+                CompletePendingDelivery(frame.Header);
                 break;
             case UnbindResp:
                 // The ESME acknowledged a server-initiated unbind; the exchange is drained.
@@ -237,6 +239,62 @@ public sealed class SmppServerSession : ISmppSessionContext, IAsyncDisposable
                 var nack = GenericNackHandler.Build(Encoding, frame.Header.SequenceNumber, SmppErrorCode.ESME_RINVCMDID);
                 await SendAsync(nack, cancellationToken).ConfigureAwait(false);
                 break;
+        }
+    }
+
+    /// <summary>
+    ///     Answers a recognised PDU whose body could not be parsed. The frame was read in full, so the session stays
+    ///     open: a request gets its own response type with the error status (SMPP v5.0 §2.8.2), and a response is
+    ///     acted on from its header alone.
+    /// </summary>
+    private async Task HandleMalformedAsync(PDUHeader header, SmppErrorCode parseError, CancellationToken cancellationToken)
+    {
+        const uint responseBit = 0x80000000;
+        const uint headerLength = 16;
+        var commandId = (uint)header.CommandType;
+
+        if ((commandId & responseBit) != 0)
+        {
+            Logger.LogDebug(
+                "Session {SessionId} received {Command} with an unparseable body ({Error}); using its header only",
+                SessionId, header.CommandType, parseError);
+
+            // command_status is authoritative, e.g. a v5.0 deliver_sm_resp carrying TLVs the PDU library rejects.
+            switch (header.CommandType)
+            {
+                case CommandType.DeliverSmResp or CommandType.GenericNack:
+                    CompletePendingDelivery(header);
+                    break;
+                case CommandType.UnBindResp:
+                    _unbindRequested = true;
+                    break;
+            }
+
+            return;
+        }
+
+        Logger.LogWarning(
+            "Session {SessionId} rejected malformed {Command} (sequence {Sequence}) with {Error}",
+            SessionId, header.CommandType, header.SequenceNumber, parseError);
+
+        if (header.CommandType is CommandType.OutBind or CommandType.AlertNotification)
+        {
+            // These operations have no response PDU of their own.
+            var nack = GenericNackHandler.Build(Encoding, header.SequenceNumber, parseError);
+            await SendAsync(nack, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var response = new PDUHeader(
+            (CommandType)(commandId | responseBit), header.SequenceNumber, parseError, headerLength);
+        await SendRawAsync(response.GetBytes(Encoding), cancellationToken).ConfigureAwait(false);
+    }
+
+    private void CompletePendingDelivery(PDUHeader header)
+    {
+        if (_pendingDeliveries.TryRemove(header.SequenceNumber, out var pending))
+        {
+            pending.TrySetResult(header.ErrorCode);
         }
     }
 
