@@ -1,0 +1,137 @@
+using Elyfe.Smpp.Server.Authentication;
+using JamaaTech.Smpp.Net.Lib;
+using JamaaTech.Smpp.Net.Lib.Protocol;
+using JamaaTech.Smpp.Net.Lib.Protocol.Tlv;
+using Microsoft.Extensions.Logging;
+
+namespace Elyfe.Smpp.Server.Handlers;
+
+/// <summary>
+///     Handles <c>bind_transmitter</c>, <c>bind_receiver</c> and <c>bind_transceiver</c> requests:
+///     negotiates the interface version, authenticates the credentials and transitions the session into a
+///     bound state. Implements SMPP §4.1.1.
+/// </summary>
+public static class BindRequestHandler
+{
+    /// <summary>
+    ///     Processes a bind request.
+    /// </summary>
+    public static async Task HandleAsync(ISmppSessionContext ctx, BindRequest request, CancellationToken cancellationToken)
+    {
+        var response = (BindResponse)request.CreateDefaultResponse();
+        response.SystemID = ctx.Options.SystemId;
+
+        if (ctx.Status != SmppSessionStatus.Open)
+        {
+            ctx.Logger.LogWarning("Bind rejected for session {SessionId}: already bound", ctx.SessionId);
+            response.Header.ErrorCode = SmppErrorCode.ESME_RALYBND;
+            ctx.Metrics.RecordBind("already_bound");
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var version = request.InterfaceVersion;
+        if (version < ctx.Options.MinInterfaceVersion || version > ctx.Options.MaxInterfaceVersion)
+        {
+            ctx.Logger.LogWarning(
+                "Bind rejected for session {SessionId}: unsupported interface_version 0x{Version:X2}",
+                ctx.SessionId,
+                version);
+            // The spec defines no status for an unsupported version; ESME_RINVBNDSTS would wrongly imply the
+            // session is in the wrong state.
+            response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
+            ctx.Metrics.RecordBind("bad_version");
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(request.SystemID))
+        {
+            response.Header.ErrorCode = SmppErrorCode.ESME_RINVSYSID;
+            ctx.Metrics.RecordBind("missing_system_id");
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // Reserved before the asynchronous authentication so concurrent binds cannot all pass the cap check.
+        if (!ctx.TryReserveSystemId(request.SystemID))
+        {
+            ctx.Logger.LogWarning(
+                "Bind rejected for system_id {SystemId}: per-system_id connection cap reached",
+                request.SystemID);
+            response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
+            ctx.Metrics.RecordBind("cap_reached");
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var credentials = new SmppCredentials(
+            request.SystemID,
+            request.Password ?? string.Empty,
+            request.SystemType,
+            ctx.RemoteAddress);
+
+        AuthenticationResult auth;
+        try
+        {
+            auth = await ctx.Authenticator.AuthenticateAsync(credentials, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ctx.Logger.LogError(ex, "Authentication error for session {SessionId} system_id {SystemId}",
+                ctx.SessionId, request.SystemID);
+            response.Header.ErrorCode = SmppErrorCode.ESME_RSYSERR;
+            ctx.Metrics.RecordBind("auth_error");
+            ctx.ReleaseSystemId();
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (!auth.Succeeded || auth.TenantId is null)
+        {
+            ctx.Logger.LogWarning("Bind authentication failed for system_id {SystemId}: {Reason}",
+                request.SystemID, auth.FailureReason);
+            response.Header.ErrorCode = SmppErrorCode.ESME_RBINDFAIL;
+            ctx.Metrics.RecordBind("auth_failed");
+            ctx.ReleaseSystemId();
+            await SendErrorAsync(ctx, response, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var mode = request.Header.CommandType switch
+        {
+            CommandType.BindTransmitter => SmppBindMode.Transmitter,
+            CommandType.BindReceiver => SmppBindMode.Receiver,
+            _ => SmppBindMode.Transceiver
+        };
+
+        ctx.MarkBound(mode, request.SystemID, auth.TenantId, version);
+
+        // SMPP v5.0 §2.11.2: the MC should advertise its version so the ESME knows TLVs are supported, but must not
+        // send TLVs to an ESME that bound with a pre-v3.4 interface_version.
+        if (version >= (byte)SmppInterfaceVersion.V34)
+        {
+            response.SetOptionalParamByte<byte>(Tag.SC_interface_version, ctx.Options.AdvertisedInterfaceVersion);
+        }
+
+        response.Header.ErrorCode = SmppErrorCode.ESME_ROK;
+        ctx.Metrics.RecordBind("ok");
+        await ctx.SendAsync(response, cancellationToken).ConfigureAwait(false);
+
+        ctx.Logger.LogInformation(
+            "Session {SessionId} bound as {Mode} for system_id {SystemId} (tenant {TenantId}, v0x{Version:X2})",
+            ctx.SessionId, mode, request.SystemID, auth.TenantId, version);
+    }
+
+    /// <summary>
+    ///     Sends a failed bind response as a header only: per SMPP v3.4 §4.1.2 the body (the SMSC
+    ///     <c>system_id</c>) is not returned when <c>command_status</c> is non-zero.
+    /// </summary>
+    private static Task SendErrorAsync(ISmppSessionContext ctx, BindResponse response, CancellationToken cancellationToken)
+    {
+        const uint headerLength = 16;
+        var header = new PDUHeader(
+            response.Header.CommandType, response.Header.SequenceNumber, response.Header.ErrorCode, headerLength);
+        return ctx.SendRawAsync(header.GetBytes(ctx.Encoding), cancellationToken);
+    }
+}
